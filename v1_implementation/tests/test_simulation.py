@@ -8,16 +8,16 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from my_implementation.src import db
-from my_implementation.src.circuits import generate_ghz_circuit, generate_qft_circuit
-from my_implementation.src.frontend import circuit_dict_to_gates
-from my_implementation.src.gate_loader import register_gate_types
-from my_implementation.src.simulator import run_circuit
-from my_implementation.src.state_manager import fetch_state, initialize_state, apply_gate_atomic
-from my_implementation.src.recovery import recover
+from v1_implementation.src import db
+from v1_implementation.src.circuits import generate_ghz_circuit, generate_qft_circuit
+from v1_implementation.src.frontend import circuit_dict_to_gates
+from v1_implementation.src.gate_loader import register_gate_types
+from v1_implementation.src.simulator import run_circuit
+from v1_implementation.src.state_manager import fetch_state, initialize_state, apply_gate_atomic
+from v1_implementation.src.recovery import recover
 
 
-SCHEMA = "/Users/andreaonofrei/Desktop/Quantum Thesis/my_try/my_implementation/sql/schema.sql"
+SCHEMA = "/Users/andreaonofrei/Desktop/Quantum Thesis/my_try/v1_implementation/sql/schema.sql"
 
 
 def connect_db():

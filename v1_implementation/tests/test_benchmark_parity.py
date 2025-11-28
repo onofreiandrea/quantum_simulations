@@ -16,12 +16,12 @@ if str(ROOT / "Quantum") not in sys.path:
 
 import InfiniQuantumSim.TLtensor as tlt  # noqa: E402
 
-from my_implementation.src import db  # noqa: E402
-from my_implementation.src.frontend import circuit_dict_to_gates  # noqa: E402
-from my_implementation.src.simulator import run_circuit  # noqa: E402
-from my_implementation.src.state_manager import fetch_state  # noqa: E402
+from v1_implementation.src import db  # noqa: E402
+from v1_implementation.src.frontend import circuit_dict_to_gates  # noqa: E402
+from v1_implementation.src.simulator import run_circuit  # noqa: E402
+from v1_implementation.src.state_manager import fetch_state  # noqa: E402
 
-SCHEMA = str(ROOT / "my_implementation" / "sql" / "schema.sql")
+SCHEMA = str(ROOT / "v1_implementation" / "sql" / "schema.sql")
 MAX_COMPARE_QUBITS = int(os.environ.get("BENCHMARK_PARITY_MAX_QUBITS", "16"))
 
 BENCHMARK_CIRCUITS = [

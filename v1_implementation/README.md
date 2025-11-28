@@ -3,12 +3,12 @@
 ## Quick start
 
 ```bash
-pip install -r my_implementation/requirements.txt
-BENCHMARK_PARITY_MAX_QUBITS=12 pytest my_implementation/tests   # fast run
-pytest my_implementation/tests                                # full sweep
+pip install -r v1_implementation/requirements.txt
+BENCHMARK_PARITY_MAX_QUBITS=12 pytest v1_implementation/tests   # fast run
+pytest v1_implementation/tests                                # full sweep
 ```
 
-For the original benchmarking workflow open `my_implementation/benchmark.ipynb`, run all cells, and it will reproduce the GHZ/W/QFT/QPE sweeps (with optional comparisons against the legacy implementation).
+For the original benchmarking workflow open `v1_implementation/benchmark.ipynb`, run all cells, and it will reproduce the GHZ/W/QFT/QPE sweeps (with optional comparisons against the legacy implementation).
 
 ---
 
