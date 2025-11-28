@@ -1,9 +1,0 @@
-# Python artifacts
-__pycache__/
-*.pyc
-.pytest_cache/
-
-checkpoints
-Quantum
-sql-einsum
-
