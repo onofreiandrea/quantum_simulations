@@ -24,7 +24,7 @@ For the original benchmarking workflow open `my_implementation/benchmark.ipynb`,
 
 ---
 
-## Modules at a glance
+## Modules
 
 - `src/gates.py` – numpy tensors for every 1-/2-qubit gate (H, X, CZ, CRk, CU, …).
 - `src/circuits.py` – GHZ, QFT, QPE, W, GHZ-QFT, etc., identical to the original repo.
