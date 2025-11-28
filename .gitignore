@@ -1,0 +1,8 @@
+# Python artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local run outputs
+checkpoints/benchmark_notebook/**/*.db
+
