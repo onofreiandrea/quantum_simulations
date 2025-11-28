@@ -1,0 +1,10 @@
+# Core simulation dependencies
+numpy>=2.0,<3
+duckdb>=1.4
+
+# Reference / benchmarking stack
+opt_einsum==3.3.0
+
+# Test suite
+pytest>=8.0
+
