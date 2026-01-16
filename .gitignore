@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (too large for git)
+v3_hisvsim_spark/data/
+v2_spark/data/
+checkpoints/
+
+# Logs
+*.log
+/tmp/
+
+# Docker
+docker-compose.override.yml
+
+# Environment
+.env
+.venv
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Spark
+spark-warehouse/
+metastore_db/
+
+# Temporary test files
+v3_hisvsim_spark/data/test_*
+v3_hisvsim_spark/data/comprehensive_test_*
+v3_hisvsim_spark/data/clean_test_*
+v3_hisvsim_spark/data/max_test_*
+v3_hisvsim_spark/data/non_stabilizer_*
+
+# Results documentation
+v3_hisvsim_spark/MAX_RESULTS.md

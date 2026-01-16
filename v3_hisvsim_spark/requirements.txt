@@ -1,0 +1,17 @@
+# Core Spark dependencies
+pyspark>=3.5,<5
+numpy>=1.21,<2
+
+# HiSVSIM dependencies
+networkx>=3.0  # For graph algorithms
+pybind11>=2.10  # For C++ wrapper (if building)
+
+# Metadata store
+duckdb>=1.4
+
+# Test suite
+pytest>=8.0
+pandas>=2.0
+
+# MPI support (optional, for HiSVSIM compatibility)
+mpi4py>=3.1  # Optional
