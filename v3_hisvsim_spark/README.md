@@ -1,95 +1,74 @@
-# v3: HiSVSIM + Spark Integration
+# v3: HiSVSIM + Spark Quantum Simulator
 
-This is v3 of the quantum simulator, integrating **HiSVSIM's circuit partitioning** with **Apache Spark** for distributed execution.
+A distributed quantum circuit simulator that splits circuits into parallelizable parts and runs them on Spark.
 
-## Architecture
+## How It Works
 
+1. **Input**: You give it a quantum circuit (list of gates)
+2. **Partitioning**: HiSVSIM figures out which gates can run in parallel by building a dependency graph
+3. **Execution**: Spark runs the parallel gates across multiple workers
+4. **Merge**: Results get combined back into the final quantum state
+
+## What It Can Do
+
+- Simulates up to 30 qubits (1.07 billion amplitudes) for non-stabilizer circuits
+- Handles both sparse states (few non-zero amplitudes) and dense states (all amplitudes)
+- Supports fault tolerance with checkpoints and recovery
+- Works in parallel or sequential mode
+
+## Quick Start
+
+```python
+from driver import SparkHiSVSIMDriver
+from v2_common import config, circuits
+
+# Setup
+cfg = config.SimulatorConfig(
+    base_path=Path("./data"),
+    spark_master="local[2]",
+    spark_shuffle_partitions=4,
+    batch_size=10,
+)
+cfg.ensure_paths()
+
+# Run a circuit
+circuit = circuits.generate_ghz_circuit(3)
+with SparkHiSVSIMDriver(cfg, enable_parallel=True) as driver:
+    result = driver.run_circuit(circuit, enable_parallel=True, resume=False)
+    state = driver.get_state_vector(result)
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Circuit Input (QASM or Circuit Dict)                        │
-└─────────────────────────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────────────────────────┐
-│  HiSVSIM Circuit Partitioning                                │
-│  - Build DAG from circuit                                    │
-│  - Partition into acyclic sub-circuits                      │
-│  - Output: List of independent partitions                   │
-└─────────────────────────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────────────────────────┐
-│  Spark Parallel Execution                                    │
-│                                                              │
-│  Partition 1 → Worker 1 → State 1                          │
-│  Partition 2 → Worker 2 → State 2                          │
-│  Partition 3 → Worker 3 → State 3                          │
-│  ...                                                         │
-└─────────────────────────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────────────────────────┐
-│  State Merging                                               │
-│  - Combine states from partitions                            │
-│  - Handle qubit overlaps                                     │
-│  - Final state vector                                        │
-└─────────────────────────────────────────────────────────────┘
-```
 
-## Key Features
+## Tested Gates
 
-- **Circuit-Level Parallelism**: Partition circuit into independent sub-circuits
-- **Acyclic Partitioning**: HiSVSIM's proven partitioning strategy
-- **Spark Distribution**: Leverage Spark's distributed computing
-- **State Merging**: Properly combine results from parallel partitions
+- **RY gates**: 30 qubits max - RY(π/4) on each qubit
+- **H+T gates**: 25 qubits max - Hadamard then T on each qubit
+- **H+T+CR gates**: Testing 25-30 qubits
+- **G gates**: Testing 25-30 qubits
+- **R gates**: Testing 25-30 qubits
+- **CU gates**: Testing 25-30 qubits
 
-## Components
-
-### 1. HiSVSIM Integration (`src/hisvsim/`)
-- Circuit graph building (from HiSVSIM repo)
-- Acyclic partitioning algorithms
-- Partition validation
-
-### 2. Spark Execution (`src/spark_executor/`)
-- Parallel sub-circuit simulation
-- State vector management
-- Result aggregation
-
-### 3. State Merging (`src/state_merger/`)
-- Combine partition results
-- Handle qubit overlaps
-- Final state construction
+Plus all standard gates: H, X, Y, Z, S, T, CNOT, CZ, CY, SWAP, CR
 
 ## Setup
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# Build HiSVSIM C++ wrapper (if needed)
-cd hisvsim_repo
-# Follow HiSVSIM build instructions
-
-# Run tests
-pytest tests/ -v
 ```
 
-## Usage
+For Spark, you need Java installed. Or use Docker:
 
-```python
-from src.driver import SparkHiSVSIMDriver
-from src.config import SimulatorConfig
-
-config = SimulatorConfig(
-    run_id="test",
-    base_path="./data",
-    spark_master="spark://master:7077",
-    num_partitions=4
-)
-
-driver = SparkHiSVSIMDriver(config)
-result = driver.run_circuit(circuit_dict)
+```bash
+cd ../v2_spark
+docker-compose run --rm -v "$(pwd)/../v3_hisvsim_spark:/v3" quantum-simulator bash
 ```
+
+## Files
+
+- `src/driver.py` - Main driver that orchestrates everything
+- `src/hisvsim/` - Circuit partitioning using HiSVSIM
+- `src/v2_common/` - Shared code (gates, state management, etc.)
+- `tests/` - Test suite
 
 ## References
 
-- HiSVSIM: https://github.com/pnnl/hisvsim.git
 - Paper: "Efficient Hierarchical State Vector Simulation of Quantum Circuits via Acyclic Graph Partitioning", IEEE CLUSTER 2022
-- arXiv: https://arxiv.org/pdf/2205.06973.pdf

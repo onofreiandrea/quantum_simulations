@@ -18,9 +18,12 @@ if str(V2_SPARK / "src") not in sys.path:
 if str(V3_SPARK / "src") not in sys.path:
     sys.path.insert(0, str(V3_SPARK / "src"))
 
-from src.driver import SparkHiSVSIMDriver
-from v2_spark.src.config import SimulatorConfig
-from v2_spark.src.circuits import generate_ghz_circuit, generate_qft_circuit
+from driver import SparkHiSVSIMDriver
+from v2_common import config, circuits
+
+SimulatorConfig = config.SimulatorConfig
+generate_ghz_circuit = circuits.generate_ghz_circuit
+generate_qft_circuit = circuits.generate_qft_circuit
 
 
 @pytest.fixture
