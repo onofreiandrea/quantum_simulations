@@ -1,0 +1,63 @@
+services:
+  # Standalone test environment (local[*] mode)
+  quantum-simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: quantum-simulator
+    environment:
+      - PYTHONPATH=/app
+      # Use local[*] for testing in container
+      - SPARK_MASTER=local[*]
+    volumes:
+      - ./:/app
+      - test-data:/data
+    working_dir: /app
+    command: ["python3", "-m", "pytest", "tests/", "-v", "--tb=short"]
+
+  # Run distribution verification
+  verify-distribution:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: verify-distribution
+    environment:
+      - PYTHONPATH=/app
+    volumes:
+      - ./:/app
+      - test-data:/data
+    working_dir: /app
+    command: ["python3", "scripts/verify_distribution.py"]
+
+  # Scalability test
+  scalability-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: scalability-test
+    environment:
+      - PYTHONPATH=/app
+    volumes:
+      - ./:/app
+      - test-data:/data
+    working_dir: /app
+    command: ["python3", "scripts/scalability_test.py"]
+
+  # Interactive shell for debugging
+  shell:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: quantum-shell
+    environment:
+      - PYTHONPATH=/app
+    volumes:
+      - ./:/app
+      - test-data:/data
+    working_dir: /app
+    stdin_open: true
+    tty: true
+    command: ["/bin/bash"]
+
+volumes:
+  test-data:

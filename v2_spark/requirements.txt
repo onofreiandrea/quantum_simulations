@@ -1,0 +1,16 @@
+# Core Spark dependencies
+pyspark>=3.5,<5
+numpy>=2.0,<3
+
+# Metadata store
+duckdb>=1.4
+
+# Reference / benchmarking stack
+opt_einsum==3.3.0
+
+# Test suite
+pytest>=8.0
+pandas>=2.0  # For Spark logic verification tests
+
+# Circuit partitioning (for HiSVSIM-style distribution)
+networkx>=3.0  # For graph algorithms

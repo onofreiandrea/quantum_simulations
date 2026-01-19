@@ -54,7 +54,7 @@ Instead of storing everything on one machine:
 2. **Distribute** computation across multiple machines
 3. **Combine** results efficiently
 
-This is what v3 does!
+This is what essentially the implementiation of the v3.
 
 ---
 
@@ -900,6 +900,14 @@ state_df = state_df.filter(
 4. **Fault tolerance** - WAL, checkpoints, recovery
 5. **Optimizations** - Lazy evaluation, caching, adaptive checkpointing
 
-**Result**: Can simulate up to **32 qubits** (4.29 billion amplitudes) using distributed computing!
+**Tested Non-Stabilizer Gates**:
+- **RY gates**: 30 qubits (1.07B amplitudes) - RY(π/4) on each qubit
+- **H+T gates**: 25 qubits (33.5M amplitudes) - H then T on each qubit  
+- **H+T+CR gates**: Testing 25-30 qubits - H, T, then CR between adjacent qubits
+- **G gates**: Testing 25-30 qubits - H then G(p=3) on each qubit
+- **R gates**: Testing 25-30 qubits - H then R(k=3) on each qubit
+- **CU gates**: Testing 25-30 qubits - H then CU between adjacent qubits
+
+**Maximum Achieved**: **30 qubits** (RY gates, dense state)
 
 
