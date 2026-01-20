@@ -31,6 +31,86 @@ No Docker needed. PySpark runs locally with your system Java.
 
 ---
 
+## Architecture Diagram
+
+```
++---------------------------------------------------------------------+
+|                      QUANTUM CIRCUIT INPUT                          |
+|                 {gates: [...], number_of_qubits: n}                 |
++---------------------------------------------------------------------+
+                                  |
+                                  v
++---------------------------------------------------------------------+
+|                       CIRCUIT PARTITIONER                           |
+|                                                                     |
+|   +-------------+    +-------------+    +-------------+             |
+|   | Build DAG   |--->| Find Levels |--->| Group Gates |             |
+|   |(dependencies)|   |(topological)|    |(independent)|             |
+|   +-------------+    +-------------+    +-------------+             |
+|                                                                     |
+|   Example: H(0), H(2), CNOT(0,1), CNOT(1,2)                        |
+|   Output:  Level 0: [H(0), H(2)]                                   |
+|            Level 1: [CNOT(0,1)]                                    |
+|            Level 2: [CNOT(1,2)]                                    |
++---------------------------------------------------------------------+
+                                  |
+                                  v
++---------------------------------------------------------------------+
+|                      SPARK DRIVER (Main Loop)                       |
+|                                                                     |
+|   FOR each level:                                                   |
+|     1. Write WAL entry (PENDING)                                    |
+|     2. Fuse independent single-qubit gates -> tensor product        |
+|     3. Apply gates via Spark DataFrame transformations              |
+|     4. Save new state version (Parquet)                             |
+|     5. Checkpoint if needed                                         |
+|     6. Mark WAL entry (COMMITTED)                                   |
++---------------------------------------------------------------------+
+                                  |
+                                  v
++---------------------------------------------------------------------+
+|                    PARALLEL GATE APPLICATOR                         |
+|                                                                     |
+|   Single-Qubit Gate Fusion:                                         |
+|   H(q0), H(q1), H(q2) -> H x H x H -> Single 8x8 transformation    |
+|   Benefits: 1 Spark job instead of 3                                |
+|                                                                     |
+|   Gate Application (Spark DataFrame):                               |
+|   +-------------+      +---------+      +-------------+             |
+|   | State DF    |  x   | Gate    |  =   | New State   |             |
+|   | idx | amp   |      | Matrix  |      | idx | amp   |             |
+|   | 0   | 1.0   |      | [H]     |      | 0   | 0.707 |             |
+|   +-------------+      +---------+      | 1   | 0.707 |             |
+|                                         +-------------+             |
++---------------------------------------------------------------------+
+                                  |
+                                  v
++---------------------------------------------------------------------+
+|                        STATE MANAGER                                |
+|                                                                     |
+|   +-------------+    +-------------+    +-------------+             |
+|   | Spark DF    |--->|  Parquet    |--->|  Recovery   |             |
+|   | (in memory) |    | (on disk)   |    | (on crash)  |             |
+|   +-------------+    +-------------+    +-------------+             |
+|                                                                     |
+|   Storage: data/state/run_id=xxx/state_version=N/                  |
++---------------------------------------------------------------------+
+                                  |
+                                  v
++---------------------------------------------------------------------+
+|                       SIMULATION RESULT                             |
+|                                                                     |
+|   {                                                                 |
+|     final_state: {0: 0.707+0j, 31: 0.707+0j},                      |
+|     gates_applied: 100,                                             |
+|     parallel_groups: [5, 1, 1, ...],                               |
+|     time_seconds: 45.2                                              |
+|   }                                                                 |
++---------------------------------------------------------------------+
+```
+
+---
+
 ## Scalability Results
 
 Tested maximum qubits for different circuit types:
@@ -42,11 +122,6 @@ Tested maximum qubits for different circuit types:
 | Hadamard Wall | **12** | 4,096 | O(2^n) |
 
 **The number of non-zero amplitudes determines scalability, not the qubit count.**
-
-- **Sparse circuits** (GHZ, W) scale to hundreds or thousands of qubits
-- **Dense circuits** (Hadamard wall) are limited to ~12 qubits locally due to exponential memory growth
-
-With a cluster, dense circuits can reach ~30-35 qubits before hitting memory limits.
 
 ---
 
@@ -65,42 +140,9 @@ idx  | real      | imag
 
 Only non-zero amplitudes are stored. A 1000-qubit GHZ state needs just 2 rows.
 
-### Circuit Partitioning
-
-Gates are organized into topological levels based on qubit dependencies:
-
-```
-Circuit: H(0), H(2), CNOT(0,1), CNOT(1,2)
-
-Level 0: H(0), H(2)     ← independent, run in parallel
-Level 1: CNOT(0,1)      ← depends on H(0)
-Level 2: CNOT(1,2)      ← depends on both
-```
-
-### Parallel Gate Execution
-
-Independent single-qubit gates within a level are fused into a single tensor product operation:
-
-```
-Hadamard wall (8 qubits):
-  Before: 8 separate H gate applications
-  After:  1 fused operation (H ⊗ H ⊗ H ⊗ H ⊗ H ⊗ H ⊗ H ⊗ H)
-
-Result: parallel_groups = [8]  ← all 8 gates in 1 transformation
-```
-
-### Gate Application
-
-For each gate:
-1. Extract target qubit bit from state index (bitwise ops)
-2. Join with gate matrix (broadcast to all workers)
-3. Compute new amplitudes
-4. Group by index and sum (handles interference)
-5. Filter near-zero values to maintain sparsity
-
 ### Fault Tolerance
 
-- **Write-ahead log**: Track gate progress (PENDING → COMMITTED)
+- **Write-ahead log**: Track gate progress (PENDING -> COMMITTED)
 - **Checkpoints**: Periodic state snapshots to Parquet
 - **Recovery**: Resume from last checkpoint after crash
 
@@ -119,11 +161,6 @@ src/
     ├── circuits.py              # Circuit generators (GHZ, W, QFT, etc.)
     ├── gate_applicator.py       # Applies gates via Spark
     └── state_manager.py         # State I/O (Parquet)
-
-scripts/
-├── test_max_qubits.py          # Scalability testing
-├── sparsity_analysis.py        # Sparsity impact analysis
-└── test_parallel_execution.py  # Parallel gate verification
 ```
 
 ---
@@ -136,31 +173,12 @@ scripts/
 
 ---
 
-## Why Sparsity Matters
-
-```
-GHZ-1000:     2 amplitudes    → 32 bytes    → runs in seconds
-W-200:        2.7M amplitudes → 43 MB       → runs in minutes  
-H-Wall-30:    1B amplitudes   → 16 GB       → needs a cluster
-H-Wall-50:    1 quadrillion   → 18 PB       → impossible
-```
-
-Distribution helps with speed but doesn't remove the 2^n memory requirement for dense states. Sparse circuits sidestep this entirely.
-
----
-
 ## More Details
 
-See [TECHNICAL.md](TECHNICAL.md) for:
-- Algorithm pseudocode (DAG building, topological sorting)
-- Spark execution flow
-- Gate application internals
-- Tensor product fusion
-- Fault tolerance mechanisms
-- Performance optimizations
+See [TECHNICAL.md](TECHNICAL.md) for deep technical details.
 
 ---
 
 ## References
 
-- HiSVSIM: "Efficient Hierarchical State Vector Simulation of Quantum Circuits via Acyclic Graph Partitioning", IEEE CLUSTER 2022
+- HiSVSIM: IEEE CLUSTER 2022
