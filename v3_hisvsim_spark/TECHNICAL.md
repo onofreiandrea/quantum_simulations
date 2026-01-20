@@ -485,10 +485,3 @@ With distributed Spark (multiple machines):
 
 **Key insight**: Distribution helps with dense states but has diminishing returns due to communication overhead. Sparse states can scale essentially unlimited with any setup.
 
-### The Fundamental Barrier
-
-Even with infinite compute resources:
-- 50 qubits = 2^50 amplitudes = 18 petabytes
-- 100 qubits = 2^100 amplitudes = more than atoms in the observable universe
-
-This is why quantum computers exist - they don't need to store the full state vector explicitly.
