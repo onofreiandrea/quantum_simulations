@@ -1,74 +1,166 @@
-# v3: HiSVSIM + Spark Quantum Simulator
+# Distributed Quantum Circuit Simulator
 
-A distributed quantum circuit simulator that splits circuits into parallelizable parts and runs them on Spark.
-
-## How It Works
-
-1. **Input**: You give it a quantum circuit (list of gates)
-2. **Partitioning**: HiSVSIM figures out which gates can run in parallel by building a dependency graph
-3. **Execution**: Spark runs the parallel gates across multiple workers
-4. **Merge**: Results get combined back into the final quantum state
-
-## What It Can Do
-
-- Simulates up to 30 qubits (1.07 billion amplitudes) for non-stabilizer circuits
-- Handles both sparse states (few non-zero amplitudes) and dense states (all amplitudes)
-- Supports fault tolerance with checkpoints and recovery
-- Works in parallel or sequential mode
+A Spark-based quantum simulator with parallel gate execution.
 
 ## Quick Start
 
 ```python
+from pathlib import Path
 from driver import SparkHiSVSIMDriver
-from v2_common import config, circuits
+from v2_common.config import SimulatorConfig
+from v2_common.circuits import generate_ghz_circuit
 
-# Setup
-cfg = config.SimulatorConfig(
+config = SimulatorConfig(
     base_path=Path("./data"),
-    spark_master="local[2]",
-    spark_shuffle_partitions=4,
-    batch_size=10,
+    spark_master="local[*]",
 )
-cfg.ensure_paths()
+config.ensure_paths()
 
-# Run a circuit
-circuit = circuits.generate_ghz_circuit(3)
-with SparkHiSVSIMDriver(cfg, enable_parallel=True) as driver:
-    result = driver.run_circuit(circuit, enable_parallel=True, resume=False)
+with SparkHiSVSIMDriver(config) as driver:
+    result = driver.run_circuit(generate_ghz_circuit(100), resume=False)
     state = driver.get_state_vector(result)
 ```
 
-## Tested Gates
+## Requirements
 
-- **RY gates**: 30 qubits max - RY(π/4) on each qubit
-- **H+T gates**: 25 qubits max - Hadamard then T on each qubit
-- **H+T+CR gates**: Testing 25-30 qubits
-- **G gates**: Testing 25-30 qubits
-- **R gates**: Testing 25-30 qubits
-- **CU gates**: Testing 25-30 qubits
+- Python 3.10+
+- Java 11+ (for Spark)
+- `pip install -r requirements.txt`
 
-Plus all standard gates: H, X, Y, Z, S, T, CNOT, CZ, CY, SWAP, CR
+No Docker needed. PySpark runs locally with your system Java.
 
-## Setup
+---
 
-```bash
-pip install -r requirements.txt
+## Scalability Results
+
+Tested maximum qubits for different circuit types:
+
+| Circuit | Max Qubits | Non-Zero Amplitudes | Sparsity |
+|---------|------------|---------------------|----------|
+| GHZ | **1000** | 2 | O(1) |
+| W State | **200** | 2.7M | O(n) |
+| Hadamard Wall | **12** | 4,096 | O(2^n) |
+
+**The number of non-zero amplitudes determines scalability, not the qubit count.**
+
+- **Sparse circuits** (GHZ, W) scale to hundreds or thousands of qubits
+- **Dense circuits** (Hadamard wall) are limited to ~12 qubits locally due to exponential memory growth
+
+With a cluster, dense circuits can reach ~30-35 qubits before hitting memory limits.
+
+---
+
+## How It Works
+
+### State Representation
+
+Quantum states are stored as Spark DataFrames with sparse representation:
+
+```
+idx  | real      | imag
+-----|-----------|----------
+0    | 0.707107  | 0.0
+31   | 0.707107  | 0.0
 ```
 
-For Spark, you need Java installed. Or use Docker:
+Only non-zero amplitudes are stored. A 1000-qubit GHZ state needs just 2 rows.
 
-```bash
-cd ../v2_spark
-docker-compose run --rm -v "$(pwd)/../v3_hisvsim_spark:/v3" quantum-simulator bash
+### Circuit Partitioning
+
+Gates are organized into topological levels based on qubit dependencies:
+
+```
+Circuit: H(0), H(2), CNOT(0,1), CNOT(1,2)
+
+Level 0: H(0), H(2)     ← independent, run in parallel
+Level 1: CNOT(0,1)      ← depends on H(0)
+Level 2: CNOT(1,2)      ← depends on both
 ```
 
-## Files
+### Parallel Gate Execution
 
-- `src/driver.py` - Main driver that orchestrates everything
-- `src/hisvsim/` - Circuit partitioning using HiSVSIM
-- `src/v2_common/` - Shared code (gates, state management, etc.)
-- `tests/` - Test suite
+Independent single-qubit gates within a level are fused into a single tensor product operation:
+
+```
+Hadamard wall (8 qubits):
+  Before: 8 separate H gate applications
+  After:  1 fused operation (H ⊗ H ⊗ H ⊗ H ⊗ H ⊗ H ⊗ H ⊗ H)
+
+Result: parallel_groups = [8]  ← all 8 gates in 1 transformation
+```
+
+### Gate Application
+
+For each gate:
+1. Extract target qubit bit from state index (bitwise ops)
+2. Join with gate matrix (broadcast to all workers)
+3. Compute new amplitudes
+4. Group by index and sum (handles interference)
+5. Filter near-zero values to maintain sparsity
+
+### Fault Tolerance
+
+- **Write-ahead log**: Track gate progress (PENDING → COMMITTED)
+- **Checkpoints**: Periodic state snapshots to Parquet
+- **Recovery**: Resume from last checkpoint after crash
+
+---
+
+## Project Structure
+
+```
+src/
+├── driver.py                    # Main orchestrator
+├── parallel_gate_applicator.py  # Fuses independent gates
+├── hisvsim/
+│   └── partition_adapter.py     # Circuit partitioning (DAG, levels)
+└── v2_common/
+    ├── config.py                # Configuration
+    ├── circuits.py              # Circuit generators (GHZ, W, QFT, etc.)
+    ├── gate_applicator.py       # Applies gates via Spark
+    └── state_manager.py         # State I/O (Parquet)
+
+scripts/
+├── test_max_qubits.py          # Scalability testing
+├── sparsity_analysis.py        # Sparsity impact analysis
+└── test_parallel_execution.py  # Parallel gate verification
+```
+
+---
+
+## Supported Gates
+
+**Single-qubit:** H, X, Y, Z, S, T, RY, R, G
+
+**Two-qubit:** CNOT, CZ, CY, SWAP, CR, CU
+
+---
+
+## Why Sparsity Matters
+
+```
+GHZ-1000:     2 amplitudes    → 32 bytes    → runs in seconds
+W-200:        2.7M amplitudes → 43 MB       → runs in minutes  
+H-Wall-30:    1B amplitudes   → 16 GB       → needs a cluster
+H-Wall-50:    1 quadrillion   → 18 PB       → impossible
+```
+
+Distribution helps with speed but doesn't remove the 2^n memory requirement for dense states. Sparse circuits sidestep this entirely.
+
+---
+
+## More Details
+
+See [TECHNICAL.md](TECHNICAL.md) for:
+- Algorithm pseudocode (DAG building, topological sorting)
+- Spark execution flow
+- Gate application internals
+- Tensor product fusion
+- Fault tolerance mechanisms
+- Performance optimizations
+
+---
 
 ## References
 
-- Paper: "Efficient Hierarchical State Vector Simulation of Quantum Circuits via Acyclic Graph Partitioning", IEEE CLUSTER 2022
+- HiSVSIM: "Efficient Hierarchical State Vector Simulation of Quantum Circuits via Acyclic Graph Partitioning", IEEE CLUSTER 2022
