@@ -13,7 +13,9 @@ ENDIANNESS = "little"
 
 GATES_1Q_NO_PARAMS = frozenset({"H", "X", "Y", "Z", "S", "T"})
 GATES_1Q_PARAM_SPEC: dict[str, dict[str, type | str]] = {
+    "RX": {"theta": float},
     "RY": {"theta": float},
+    "RZ": {"theta": float},
     "R":  {"k": int},
     "G":  {"p": int},
 }

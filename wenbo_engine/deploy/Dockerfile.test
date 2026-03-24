@@ -1,0 +1,9 @@
+FROM python:3.11-slim-bookworm
+
+RUN apt-get update && apt-get install -y default-jre-headless && rm -rf /var/lib/apt/lists/*
+RUN pip install numpy pyspark==3.5.4 pytest
+
+WORKDIR /app
+COPY . /app/
+
+CMD ["python3", "-m", "pytest", "wenbo_engine/tests/", "-x", "-q"]

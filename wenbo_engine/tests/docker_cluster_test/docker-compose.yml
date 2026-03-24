@@ -1,0 +1,36 @@
+services:
+  master:
+    build: .
+    hostname: spark-master
+    command: bash /code/wenbo_engine/tests/docker_cluster_test/start_master.sh
+    volumes:
+      - shared_data:/mnt/nvme/wenbo_data
+      - ../../../:/code
+    depends_on:
+      - worker1
+      - worker2
+
+  worker1:
+    build: .
+    hostname: spark-worker1
+    command: >
+      bash -c "sleep 3 &&
+        /opt/spark/sbin/start-worker.sh spark://spark-master:7077 --cores 2 --memory 2g &&
+        tail -f /dev/null"
+    volumes:
+      - shared_data:/mnt/nvme/wenbo_data
+      - ../../../:/code
+
+  worker2:
+    build: .
+    hostname: spark-worker2
+    command: >
+      bash -c "sleep 3 &&
+        /opt/spark/sbin/start-worker.sh spark://spark-master:7077 --cores 2 --memory 2g &&
+        tail -f /dev/null"
+    volumes:
+      - shared_data:/mnt/nvme/wenbo_data
+      - ../../../:/code
+
+volumes:
+  shared_data:

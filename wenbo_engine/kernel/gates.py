@@ -41,9 +41,16 @@ def T():
 
 
 # ── 1-qubit parameterised ──────────────────────────────────────────
+def RX(theta: float):
+    c, s = np.cos(theta / 2), np.sin(theta / 2)
+    return _mat([c, -1j*s], [-1j*s, c])
+
 def RY(theta: float):
     c, s = np.cos(theta / 2), np.sin(theta / 2)
     return _mat([c, -s], [s, c])
+
+def RZ(theta: float):
+    return _mat([np.exp(-1j*theta/2), 0], [0, np.exp(1j*theta/2)])
 
 def R(k: int):
     return _mat([1, 0], [0, np.exp(2j * np.pi / 2**k)])
@@ -84,7 +91,7 @@ def CU(U: np.ndarray, exponent: int):
 
 # ── dispatcher ──────────────────────────────────────────────────────
 _FIXED_1Q = {"H": H, "X": X, "Y": Y, "Z": Z, "S": S, "T": T}
-_PARAM_1Q = {"RY": RY, "R": R, "G": G}
+_PARAM_1Q = {"RX": RX, "RY": RY, "RZ": RZ, "R": R, "G": G}
 _FIXED_2Q = {"CNOT": CNOT, "SWAP": SWAP, "CZ": CZ, "CY": CY}
 _PARAM_2Q = {"CR": CR, "CU": CU}
 
@@ -95,8 +102,8 @@ def gate_matrix(name: str, params: dict) -> np.ndarray:
         return _FIXED_1Q[name]()
     if name in _FIXED_2Q:
         return _FIXED_2Q[name]()
-    if name == "RY":
-        return RY(params["theta"])
+    if name in ("RX", "RY", "RZ"):
+        return _PARAM_1Q[name](params["theta"])
     if name == "R":
         return R(params["k"])
     if name == "G":
