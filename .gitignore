@@ -60,3 +60,6 @@ v3_hisvsim_spark/data/non_stabilizer_*
 
 # Results documentation
 v3_hisvsim_spark/MAX_RESULTS.md
+
+# Backup archives
+*.zip

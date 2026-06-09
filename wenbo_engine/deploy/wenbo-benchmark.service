@@ -1,0 +1,39 @@
+[Unit]
+Description=wenbo_engine MPI Benchmark (resumable via WAL)
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/quantum_simulations
+
+# The script is idempotent: skips completed smoke test,
+# resumes 38q from WAL checkpoint, exits 0 on success.
+ExecStart=/home/ubuntu/quantum_simulations/wenbo_engine/deploy/run_mpi_experiments.sh \
+    --hostfile /home/ubuntu/hostfile
+
+# Auto-restart on crash (non-zero exit). Does NOT restart on clean exit (0).
+Restart=on-failure
+RestartSec=30
+
+# Stop restarting after 10 failures within 1 hour (prevents infinite loop
+# if there's a persistent issue like misconfiguration).
+StartLimitIntervalSec=3600
+StartLimitBurst=10
+
+# Environment
+Environment=HOME=/home/ubuntu
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin
+Environment=PYTHONPATH=/home/ubuntu/quantum_simulations
+
+# Log to file (survives SSH disconnect, readable after reboot)
+StandardOutput=append:/mnt/nvme/wenbo_data/benchmark.log
+StandardError=append:/mnt/nvme/wenbo_data/benchmark.log
+
+# No timeout — the benchmark runs for hours
+TimeoutStartSec=infinity
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

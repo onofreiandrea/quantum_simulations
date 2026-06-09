@@ -23,27 +23,38 @@ sudo apt-get install -y -qq \
     git htop tmux
 
 echo "=== [2/5] Format + mount NVMe ==="
-# i3en instances have instance store NVMe at /dev/nvme1n1 (or similar)
-NVME_DEV=""
-for dev in /dev/nvme1n1 /dev/nvme2n1 /dev/nvme0n1; do
-    # skip the root EBS volume
-    if [ -b "$dev" ] && ! mount | grep -q "$dev"; then
-        NVME_DEV="$dev"
-        break
+# i3en instances have 2 instance store NVMe drives (plus the root EBS).
+# Mount both: /mnt/nvme (data + NFS) and /mnt/nvme2 (Spark shuffle/spill).
+NVME_DEVS=()
+for dev in /dev/nvme0n1 /dev/nvme1n1 /dev/nvme2n1; do
+    if [ -b "$dev" ] && ! lsblk "$dev" 2>/dev/null | grep -q part; then
+        NVME_DEVS+=("$dev")
     fi
 done
 
-if [ -z "$NVME_DEV" ]; then
-    echo "No unmounted NVMe found. Available block devices:"
-    lsblk
-    echo "Falling back to /tmp"
-    NVME_MOUNT="/tmp"
-else
-    sudo mkfs.ext4 -F "$NVME_DEV"
+echo "Found ${#NVME_DEVS[@]} unmounted NVMe drive(s): ${NVME_DEVS[*]}"
+
+if [ ${#NVME_DEVS[@]} -ge 1 ]; then
+    sudo mkfs.ext4 -F "${NVME_DEVS[0]}"
     sudo mkdir -p "$NVME_MOUNT"
-    sudo mount "$NVME_DEV" "$NVME_MOUNT"
+    sudo mount "${NVME_DEVS[0]}" "$NVME_MOUNT"
     sudo chmod 777 "$NVME_MOUNT"
-    echo "NVMe $NVME_DEV mounted at $NVME_MOUNT"
+    echo "NVMe ${NVME_DEVS[0]} mounted at $NVME_MOUNT"
+else
+    echo "No unmounted NVMe found. Falling back to /tmp"
+    NVME_MOUNT="/tmp"
+fi
+
+NVME2_MOUNT="/mnt/nvme2"
+if [ ${#NVME_DEVS[@]} -ge 2 ]; then
+    sudo mkfs.ext4 -F "${NVME_DEVS[1]}"
+    sudo mkdir -p "$NVME2_MOUNT"
+    sudo mount "${NVME_DEVS[1]}" "$NVME2_MOUNT"
+    sudo chmod 777 "$NVME2_MOUNT"
+    echo "NVMe ${NVME_DEVS[1]} mounted at $NVME2_MOUNT"
+else
+    NVME2_MOUNT="$NVME_MOUNT"
+    echo "Only 1 NVMe — using $NVME_MOUNT for both data and Spark tmp"
 fi
 
 echo "=== [3/5] Install Spark ==="
@@ -67,13 +78,15 @@ echo "=== [4/5] Python deps ==="
 sudo pip3 install numpy pyspark==3.5.8 pytest 2>/dev/null || \
     sudo pip3 install --break-system-packages numpy pyspark==3.5.8 pytest
 
-echo "=== [5/5] Work directory ==="
+echo "=== [5/5] Work directories ==="
 WORK_DIR="${NVME_MOUNT}/wenbo_data"
-mkdir -p "$WORK_DIR"
-echo "Work dir: $WORK_DIR"
+SPARK_TMP="${NVME2_MOUNT}/spark_tmp"
+mkdir -p "$WORK_DIR" "$SPARK_TMP"
+echo "Work dir:  $WORK_DIR"
+echo "Spark tmp: $SPARK_TMP"
 
 # quick disk speed check
-echo "Disk write speed:"
+echo "Disk write speed (data):"
 dd if=/dev/zero of="$WORK_DIR/_test" bs=1M count=512 conv=fdatasync 2>&1 | tail -1
 rm -f "$WORK_DIR/_test"
 

@@ -42,9 +42,17 @@ def main():
 
     errors = []
 
+    # Use NFS-accessible dir for checkpoints (local /tmp doesn't work on
+    # distributed clusters — each executor writes to its own local FS).
+    shared_base = "/mnt/nvme/wenbo_data"
+    if os.path.isdir(shared_base):
+        tmpdir_base = shared_base
+    else:
+        tmpdir_base = None  # fallback to system tmp for local-mode testing
+
     # Test 1: clean run
     print(f"[1/3] Clean run: {n}q, 10 gates, {total_steps} steps")
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(dir=tmpdir_base) as td:
         result = run(cd, sc, chunk_size=chunk_size,
                      checkpoint_dir=td, use_wal=True)
         got = collect_state_rdd(result)
@@ -56,7 +64,7 @@ def main():
 
     # Test 2: crash + recover
     print(f"[2/3] Crash at step {crash_at}/{total_steps}, then recover")
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(dir=tmpdir_base) as td:
         os.environ["WE_CRASH_AFTER_STEP"] = str(crash_at)
         try:
             run(cd, sc, chunk_size=chunk_size,

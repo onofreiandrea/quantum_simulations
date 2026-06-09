@@ -1,0 +1,634 @@
+\section{Introduction}
+\label{sec:introduction}
+
+Classical simulation of quantum circuits is indispensable in the
+current Noisy Intermediate-Scale Quantum (NISQ) era: it provides
+the ground truth needed to validate quantum algorithms, characterise
+noise models, and benchmark nascent hardware against classical
+baselines. Yet full state-vector simulation is inherently expensive.
+Representing the state of an $n$-qubit system requires storing
+$2^n$ complex amplitudes, and at double precision this amounts to
+over 16\,petabytes for 50~qubits~\cite{wang2021quantum}---far
+exceeding the memory of any single machine and rivalling the
+aggregate capacity of the largest supercomputers.
+
+High-performance simulators have tackled this exponential barrier
+through distributed memory, GPU acceleration, and careful gate
+scheduling~\cite{wang2021quantum}, achieving impressive qubit counts
+on dedicated HPC infrastructure. However, most of these systems
+are designed for short-lived batch jobs: they provide limited or no
+support for out-of-core execution on commodity hardware,
+checkpointing during long-running simulations, or automatic
+recovery after failure. When a 12-hour simulation crashes at
+hour~11, the entire computation must typically be restarted from
+scratch.
+
+We argue that these gaps can be addressed by treating quantum
+circuit simulation as a \emph{data management problem}. Database
+systems have decades of experience managing datasets that exceed
+main memory, ensuring transactional atomicity, and recovering
+consistently after failures---techniques that map naturally onto the
+lifecycle of a long-running state-vector simulation. Recent work by
+Hai~et~al.~\cite{hai2025cqms} has begun to explore this connection,
+demonstrating how relational modelling, structured logging, and
+query-style interfaces can bring principled data management to
+quantum computing workflows. Our work builds on this vision and
+investigates the complementary question: can database-inspired
+recovery and storage techniques enable fault-tolerant, large-scale
+quantum state-vector simulation on commodity hardware?
+
+We present an out-of-core state-vector simulator that separates
+\emph{control} (scheduling, fault tolerance, metadata) from
+\emph{data} (the numeric kernel operating on amplitudes). The
+$2^n$-dimensional state is stored as dense binary chunks on disk and
+streamed through CPU kernels, while Apache~Spark is retained purely
+for task distribution across nodes---no amplitude data passes through
+Spark's shuffle or aggregation machinery. Crash safety is provided
+by double-buffered storage with a write-ahead log (WAL) that
+guarantees at most one step of lost work per failure. Circuit
+partitioning follows an Atlas-inspired staging
+strategy~\cite{atlas} that minimises cross-chunk communication, and
+empirical chunk-size tuning ensures the per-chunk working set remains
+cache-friendly.
+
+Our contributions are:
+\begin{enumerate}
+  \item An out-of-core streaming architecture for state-vector
+    simulation that decouples the numeric kernel from the
+    orchestration layer, achieving $300$--$10\,000\times$ speedup
+    over a Spark~DataFrame baseline on identical circuits.
+  \item A database-inspired recovery protocol---double-buffered
+    storage with atomic writes and a step-level WAL---that enables
+    crash-recoverable progress with bounded work loss.
+  \item Integration of Atlas-style ILP circuit staging, single-qubit
+    gate fusion, and level batching to reduce I/O passes and kernel
+    invocations.
+  \item An empirical evaluation demonstrating correctness across
+    147~MQT~Bench circuit instances (up to 395\,059~gates),
+    scaling to $n = 30$ ($>10^9$~amplitudes, 17\,GB on disk) on a
+    single machine, and systematic chunk-size tuning that reveals
+    a cache-driven performance cliff.
+\end{enumerate}
+
+\section{Related Work}
+\label{sec:related}
+
+This section reviews prior work relevant to scalable state-vector
+simulation and positions our contribution at the intersection of
+high-performance simulation and data management. We group related
+efforts into five categories.
+
+\paragraph{High-performance state-vector simulators.}
+Full state-vector simulators such as those deployed on the Sunway
+TaihuLight~\cite{wang2021quantum} and Summit supercomputers
+distribute the $2^n$-element amplitude vector across thousands of
+nodes, achieving 40--50~qubit simulations through careful MPI
+communication patterns and GPU offloading. These systems maximise
+throughput under the assumption of reliable infrastructure, but
+typically offer no checkpointing or crash recovery: a single node
+failure aborts the entire job.
+
+\paragraph{Locality-aware scheduling and partitioning.}
+The exponential state size makes communication the dominant cost in
+distributed simulation. Atlas~\cite{atlas} formulates circuit
+partitioning as an integer linear programme that assigns gates to
+stages and selects local qubit sets to minimise inter-node shuffles.
+Cache-blocking and gate fusion techniques further reduce memory
+traffic within each node. Our implementation adopts Atlas's ILP
+staging and extends it with insular-qubit detection for diagonal
+gates.
+
+\paragraph{Big-data frameworks for numerical workloads.}
+Apache Spark and similar dataflow engines provide built-in fault
+tolerance (lineage-based recomputation) and distributed scheduling.
+Prior work, including earlier versions of this system (v1--v3,
+Section~\ref{sec:prior-versions}), has modelled amplitudes as
+DataFrame rows and applied gates via join-aggregate queries.
+While functionally correct, the per-operator overhead of Spark's
+execution engine (job scheduling, serialisation, shuffle I/O)
+dominates the cost of the small $2\!\times\!2$ matrix updates,
+making this approach orders of magnitude slower than direct
+computation.
+
+\paragraph{Out-of-core numerical methods.}
+External-memory algorithms for linear algebra---blocked matrix
+multiply, out-of-core LU, and streaming SVD---have a long history
+in scientific computing. Our chunk-based streaming approach applies
+the same principle to state-vector simulation: the amplitude vector
+is partitioned into cache-sized blocks, streamed sequentially
+through the kernel, and written back to disk, bounding memory
+consumption independently of~$n$.
+
+\paragraph{Database-inspired fault tolerance.}
+Write-ahead logging, atomic commit protocols, and double-buffering
+are foundational techniques in database recovery~\cite{mohan1992aries}.
+Hai~et~al.~\cite{hai2025cqms} recently advocated applying such
+data management principles to quantum computing workflows, including
+simulation metadata, provenance tracking, and structured logging.
+Our system operationalises this vision for the simulation kernel
+itself: every step of state evolution is protected by a WAL and
+atomic buffer swap, ensuring consistent recovery after fail-stop
+failures with at most one step of repeated work.
+
+
+%% ----------------------------------------------------------------
+%% Implementation section follows
+%% ----------------------------------------------------------------
+
+\section{Implementation}
+\label{sec:implementation}
+
+We developed four successive prototype versions of a quantum state-vector simulator.
+Versions v1--v3 explored relational formulations where amplitudes are stored as
+database rows and gate application is expressed as join-aggregate queries. Version~v4
+(the current system) abandons the relational data plane entirely in favour of an
+out-of-core streaming kernel, while retaining Spark for orchestration and fault
+tolerance. We briefly summarise v1--v3 before describing v4 in detail.
+
+\subsection{Prior Versions (v1--v3)}
+\label{sec:prior-versions}
+
+\paragraph{v1: SQLite baseline.}
+The initial prototype stored amplitudes in a SQLite table
+\texttt{(version, idx, real, imag)} and implemented gate application as SQL
+join-and-aggregate queries over the unitary matrix entries.
+Each gate was executed inside an explicit transaction with a WAL entry
+(\texttt{PENDING} $\to$ \texttt{COMMITTED}) to guarantee atomic progress.
+This version served as a correctness reference and demonstrated that the
+relational formulation is functionally correct, but performance was limited
+by per-gate transaction overhead.
+
+\paragraph{v2: Spark DataFrames.}
+v2 ported the relational model to Apache Spark. Amplitudes were represented as
+a distributed DataFrame \texttt{(idx, real, imag)}, persisted to Parquet between
+batches. Gate application used the same join-aggregate semantics implemented with
+Spark primitives (broadcast join, \texttt{groupBy}, complex multiply-add). A
+DuckDB-backed metadata store tracked WAL entries and checkpoints. Recovery on
+restart resumed from the last committed Parquet state version.
+
+\paragraph{v3: topological levels and tensor-product fusion.}
+v3 introduced a dependency DAG over gates, grouping qubit-disjoint gates into
+topological levels. Within each level, independent single-qubit gates were fused
+via their tensor product into a single broadcast-join-aggregate pass, reducing the
+number of full-state transformations. Two-qubit gates were applied sequentially.
+While this improved throughput for circuits with large layers of independent
+single-qubit gates, every gate application still paid the cost of Spark job
+scheduling ($\sim$200--500\,ms), serialisation, and shuffle I/O.
+Benchmarking showed that v3's overhead made it 300--10\,000$\times$ slower than
+direct NumPy computation for circuits up to $n=12$ (Table~\ref{tab:v3-comparison}).
+
+\subsection{v4: Out-of-Core Streaming Kernel}
+\label{sec:v4}
+
+Guided by the observation that the core operation is a small
+$2\!\times\!2$ or $4\!\times\!4$ unitary update applied repeatedly
+across a long amplitude vector, v4 restructures the simulator to
+separate the \emph{control plane} (scheduling, fault tolerance,
+metadata) from the \emph{data plane} (numeric kernel).
+The state vector $\psi \in \mathbb{C}^{2^n}$ is stored on disk as
+dense chunk files and streamed through CPU kernels one chunk at a time.
+Spark is retained purely for task distribution across nodes; no
+DataFrame joins, shuffles, or aggregations touch the amplitude data.
+
+\subsubsection{State Storage}
+\label{sec:storage}
+
+The $2^n$ amplitudes are stored as \texttt{complex64} (single-precision
+complex, 8 bytes per amplitude) in contiguous binary chunk files.
+Each chunk holds $C = 2^k$ amplitudes for a configurable $k$; chunk~$i$
+covers the index range $[i \cdot C,\;(i{+}1) \cdot C)$. A JSON manifest
+in each buffer directory records the number of qubits, chunk size, file
+list, and creation timestamp. Every file write follows an atomic
+protocol: write to a temporary file, call \texttt{fsync}, then
+\texttt{os.replace} to the final path---ensuring that a crash at any
+point leaves either the old or the new file intact.
+
+Two buffer directories (\texttt{state\_a}, \texttt{state\_b}) alternate
+as source and destination (double-buffering). The source buffer is
+\emph{never modified} during a step; only the destination is written.
+This invariant guarantees that the source is always a valid, consistent
+snapshot of the state, enabling safe crash recovery without
+application-level undo.
+
+\subsubsection{Local and Non-Local Gate Classification}
+\label{sec:local-nonlocal}
+
+Given chunk size $C = 2^k$, the lowest $k$ bits of the amplitude index
+identify the position \emph{within} a chunk, while the upper $n{-}k$
+bits identify \emph{which chunk}. A gate on qubit~$q$ pairs amplitudes
+differing only in bit~$q$:
+\begin{itemize}
+  \item \textbf{Local} ($q < k$): both amplitudes reside in the same
+    chunk. The gate is applied by reading a single chunk, performing the
+    update in-place, and writing the result.
+  \item \textbf{Non-local} ($q \geq k$): the paired amplitudes lie in
+    different chunks. We load a \emph{partner group} of chunks (those
+    differing only in bit~$q$) and apply the gate across the group using
+    a butterfly exchange pattern~\cite{fang2022hisvsim}.
+\end{itemize}
+For two-qubit gates, four cases arise depending on whether each target
+qubit is local or non-local, requiring pairs or quads of chunks.
+
+\subsubsection{Kernels}
+\label{sec:kernels}
+
+All kernels operate on in-memory NumPy arrays and perform no I/O.
+Two CPU kernel implementations are provided:
+
+\paragraph{Scalar kernel.}
+For each pair (1Q) or quad (2Q) of index positions within a chunk,
+the kernel applies the $2\!\times\!2$ or $4\!\times\!4$ matrix update
+via explicit element-wise arithmetic. This kernel is simple and easy to
+verify.
+
+\paragraph{Batched GEMM kernel.}
+Index pairs are gathered into a $(2 \times M)$ or $(4 \times M)$ matrix
+(where $M = C/2$ or $C/4$), multiplied by the gate matrix via NumPy's
+BLAS-backed \texttt{matmul}, and scattered back. This leverages
+optimised BLAS routines and is faster when the working set fits in
+CPU cache.
+
+\paragraph{Non-local kernel.}
+For non-local gates, pure array operations combine partner chunks:
+element-wise $2\!\times\!2$ for single-qubit non-local gates, and
+element-wise $4\!\times\!4$ for fully non-local two-qubit gates.
+Mixed cases (one qubit local, one non-local) combine local pair
+extraction with cross-chunk element-wise operations.
+
+\subsubsection{Circuit Optimisations}
+\label{sec:circuit-opt}
+
+\paragraph{Levelisation and level batching.}
+Gates are grouped into dependency-free \emph{levels} via a topological
+sort on the per-qubit ordering DAG. Consecutive levels containing only
+local gates are merged into a single I/O step (one read--compute--write
+pass over all chunks instead of one per level).
+
+\paragraph{Single-qubit gate fusion.}
+Consecutive single-qubit gates on the same qubit (with no intervening
+two-qubit gate on that qubit) are pre-multiplied into a single
+$2\!\times\!2$ matrix before execution, reducing the number of kernel
+invocations.
+
+\paragraph{Atlas-style circuit staging.}
+For circuits where many gates target qubits in the non-local range
+($q \geq k$), we implement circuit staging inspired by Atlas~\cite{atlas}.
+The circuit is partitioned into \emph{stages}, each associated with a
+set of $k$ \emph{local qubits}. Between stages, SWAP operations
+physically rearrange the state vector so that the next stage's target
+qubits occupy positions $0\ldots k{-}1$.
+
+Three partitioning methods are provided:
+\begin{enumerate}
+  \item \textbf{ILP} (requires PuLP): an integer linear programme that
+    assigns gates to stages and selects local qubit sets to minimise
+    the total number of qubit transitions, faithfully reimplemented from
+    Atlas~\cite{atlas}.
+  \item \textbf{Heuristic}: a dependency-aware greedy algorithm ported
+    from Atlas's reference implementation, iteratively executing gates
+    whose non-insular qubits are in the current local set and selecting
+    the next local set by priority (qubits in the first blocked gate
+    $>$ global gate count $>$ local gate count).
+  \item \textbf{Greedy}: a simpler frequency-based lookahead from our
+    earlier prototype.
+\end{enumerate}
+Following Atlas, sparse (diagonal) gates---Z, S, T, CZ, CR---are
+treated as \emph{insular}: their qubits need not be local, as the
+conditional-phase update can be applied without a full shuffle. This
+reduces the number of required stages.
+
+\subsubsection{Runners}
+\label{sec:runners}
+
+\paragraph{Sequential runner.}
+Processes work items (chunk groups) one at a time. Memory footprint is
+minimal: at most one chunk group resides in RAM at a time.
+
+\paragraph{Pipeline runner.}
+Three threads---reader, compute worker, writer---connected by bounded
+queues of configurable depth. This overlaps disk I/O with computation.
+Non-local gate groups are processed outside the pipeline (they require
+multiple chunks loaded simultaneously).
+
+\paragraph{Spark runner.}
+Spark parallelises local-gate chunk processing across executors. Each
+executor reads its assigned chunk from disk, applies the kernel, and
+writes the result. Non-local groups are processed on the driver.
+Spark is used \emph{only for task distribution}---no amplitude data
+passes through Spark's shuffle or aggregation machinery.
+
+\subsubsection{Write-Ahead Log and Crash Recovery}
+\label{sec:wal}
+
+A single atomic JSON file (\texttt{wal.json}) records the circuit hash,
+which buffer (\texttt{a} or \texttt{b}) holds the latest committed
+state, and how many steps have been completed. Each step follows the
+protocol:
+\begin{enumerate}
+  \item Read chunks from the committed source buffer.
+  \item Apply the kernel; write results to the destination buffer
+    (atomic per-chunk writes).
+  \item Write the destination manifest atomically.
+  \item Update the WAL to flip the committed buffer and increment the
+    step counter (atomic write).
+\end{enumerate}
+On crash, recovery reads the WAL, identifies the committed buffer as
+the valid source, wipes the destination buffer (which may contain
+partial data), and resumes from the recorded step. Because the source
+buffer is never modified, the input to any interrupted step is always
+intact, guaranteeing exactly-once step semantics under fail-stop
+failures. A fencing lock file prevents concurrent processes from
+operating on the same working directory.
+
+\section{Experimental Evaluation}
+\label{sec:results}
+
+\subsection{Experimental Setup}
+All experiments were conducted on a MacBook Pro with Apple M3 Pro
+(14~cores), 48\,GB unified memory, and 460\,GB NVMe SSD
+(${\sim}3.5$\,GB/s sequential read). The simulator uses Python~3.9
+with NumPy (BLAS-backed) for kernels and PySpark in
+\texttt{local[*]} mode for the Spark runner.
+
+\subsection{Correctness Validation}
+\label{sec:correctness}
+
+We validate correctness by running each circuit through our simulator
+and comparing the resulting state vector against two independent
+oracles:
+\begin{enumerate}
+  \item \textbf{ref\_dense}: an in-memory reference simulator that
+    applies gates one-by-one to a NumPy state vector (complex128).
+    Used as ground truth for kernel-level and end-to-end tests.
+  \item \textbf{Qiskit Statevector}: Qiskit's built-in statevector
+    simulator, a mature and widely trusted implementation.
+\end{enumerate}
+To ensure coverage beyond hand-written test circuits, we draw
+147~circuit instances from 30~families in the MQT~Bench
+suite~\cite{mqtbench}---a standardised collection of quantum
+algorithm circuits including GHZ, QFT, Grover, Shor, random circuits,
+variational ans\"{a}tze, and arithmetic circuits. Each MQT~Bench
+circuit is transpiled to our basis gate set and then executed by
+(i)~our out-of-core runner, (ii)~ref\_dense, and (iii)~Qiskit
+Statevector. We compare the three output state vectors; all
+147~instances for $n = 3$ to $20$ qubits (with gate counts ranging
+from 3 for GHZ-3 to 395\,059 for Shor-18) achieve overlap
+$|\langle\psi_{\text{oracle}}|\psi_{\text{ours}}\rangle| > 1 -
+10^{-6}$ against both oracles. Little-endian qubit ordering is
+enforced by a dedicated test: applying $X$ to qubit~0 on
+$|0\rangle^n$ must produce amplitude $1.0$ at index~1.
+
+The full test suite comprises 137 unit tests covering circuit
+validation, endianness, kernel correctness (scalar, batched, non-local),
+out-of-core end-to-end vs.\ oracle, crash recovery (12 tests with
+simulated crashes via subprocesses), WAL integrity, double-buffer
+alternation, fencing lock semantics, Spark runner, gate fusion, and
+Atlas-style staging with qubit permutation.
+
+\subsection{Comparison with v3}
+\label{sec:v3-comparison}
+
+Table~\ref{tab:v3-comparison} compares v3 (Spark DataFrame gate
+application) against v4 (out-of-core kernel) on identical circuits.
+Correctness is verified: all state vectors match (overlap $= 1.0$).
+
+\begin{table}[h]
+\centering
+\caption{Runtime comparison between v3 (Spark) and v4 (kernel).}
+\label{tab:v3-comparison}
+\begin{tabular}{lrrrrr}
+\toprule
+Circuit & $n$ & Gates & v3 (s) & v4 (s) & Speedup \\
+\midrule
+GHZ-3            &  3 &     3 &   3.64 & 0.003 & 1\,097$\times$ \\
+GHZ-10           & 10 &    10 &   2.65 & 0.009 &    310$\times$ \\
+GHZ-12           & 12 &    12 &   2.98 & 0.011 &    278$\times$ \\
+QFT-6            &  6 &    21 &   3.51 & 0.008 &    417$\times$ \\
+QFT-8            &  8 &    36 &   5.52 & 0.015 &    362$\times$ \\
+MQT-dj-10        & 10 &    62 &  14.82 & 0.025 &    585$\times$ \\
+MQT-graphstate-10& 10 &    20 &   5.80 & 0.004 & 1\,318$\times$ \\
+H-wall-4         &  4 &     4 &   2.80 & 0.002 & 1\,356$\times$ \\
+H-wall-8         &  8 &     8 &   0.86 & 0.002 &    418$\times$ \\
+H-wall-12        & 12 &    12 &  94.87 & 0.009 &10\,087$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The median speedup is ${\sim}320\times$, with extremes exceeding
+$10\,000\times$. The speedup is attributable to eliminating Spark job
+scheduling, serialisation, and shuffle overhead from the critical path.
+
+\subsection{Scaling: Non-Stabilizer Circuits}
+\label{sec:scaling}
+
+To characterise scaling limits, we use non-stabilizer circuits
+(H~+~T~+~CNOT layers) that produce fully dense state vectors, ensuring
+the exponential state size is the binding constraint. All results
+include norm verification ($\|\psi\|_2 = 1 \pm 10^{-4}$).
+
+\paragraph{In-memory (ref\_dense, complex128).}
+Table~\ref{tab:scaling-inmem} shows that the in-memory simulator
+handles up to $n = 28$ (4.3\,GB state, 23\,GB peak RSS) in 6.9
+minutes on this machine. At $n = 29$, estimated peak memory
+(${\sim}46$\,GB) exceeds physical RAM.
+
+\begin{table}[h]
+\centering
+\caption{In-memory scaling (ref\_dense, complex128, non-stabilizer circuits).}
+\label{tab:scaling-inmem}
+\begin{tabular}{rrrrl}
+\toprule
+$n$ & Amplitudes & State & Time & Peak RAM \\
+\midrule
+20 &        1\,M &   17\,MB &    1.1\,s & 141\,MB \\
+24 &       16\,M &  268\,MB &   15.5\,s & 1.8\,GB \\
+26 &       67\,M & 1.07\,GB &   68.6\,s & 6.9\,GB \\
+28 &      268\,M & 4.30\,GB &  412\,s   & 23\,GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Out-of-core (on-disk, complex64).}
+Table~\ref{tab:scaling-ooc} demonstrates that the out-of-core runner
+extends the frontier to $n = 30$ (over 1 billion amplitudes, 17\,GB
+on disk, 1\,024 chunks) in 10.5 minutes. The runner's memory footprint
+is bounded by a constant number of chunks in RAM, independent of~$n$.
+Correctness is cross-validated against ref\_dense at $n = 20$.
+
+\begin{table}[h]
+\centering
+\caption{Out-of-core scaling (on-disk, complex64, non-stabilizer circuits).}
+\label{tab:scaling-ooc}
+\begin{tabular}{rrrrl}
+\toprule
+$n$ & Amplitudes & Disk & Chunks & Time \\
+\midrule
+20 &        1\,M &  0.02\,GB &      1 &    1.2\,s \\
+24 &       16\,M &  0.27\,GB &     16 &   15.4\,s \\
+26 &       67\,M &  1.07\,GB &     64 &   61\,s \\
+28 &      268\,M &  4.29\,GB &    256 &  139\,s \\
+29 &      537\,M &  8.59\,GB &    512 &  285\,s \\
+30 &    1\,074\,M & 17.2\,GB & 1\,024 &  631\,s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Chunk Size Tuning}
+\label{sec:chunk-tuning}
+
+The chunk size $C = 2^k$ is the primary hyperparameter: it determines
+how many qubits are local ($k$), the number of I/O passes, and whether
+the per-chunk working set fits in CPU cache. We swept chunk sizes
+$2^{14}$ through $2^{22}$ on non-stabilizer circuits at $n = 24$ and
+$n = 26$, testing both the sequential and pipeline runners with and
+without gate fusion.
+
+\begin{table}[h]
+\centering
+\caption{Chunk size sweep at $n = 26$ (537\,MB state, 154 gates,
+pipeline runner, fusion enabled, buffer depth 4).}
+\label{tab:chunk-sweep}
+\begin{tabular}{rrrrr}
+\toprule
+$k$ & Chunk size & Chunks & Steps & Time (s) \\
+\midrule
+14 &   0.1\,MB & 4\,096 & 19 & 63.5 \\
+16 &   0.5\,MB & 1\,024 & 17 & \textbf{40.2} \\
+18 &   2.1\,MB &    256 & 15 & \textbf{40.0} \\
+20 &   8.4\,MB &     64 & 13 & 118.9 \\
+22 &  33.6\,MB &     16 & 11 & 116.9 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The results reveal a non-monotonic relationship between chunk size and
+wall time (Table~\ref{tab:chunk-sweep}). Although larger chunks reduce
+the number of I/O steps (from 19 at $k{=}14$ to 11 at $k{=}22$),
+the optimal wall time is achieved at $k = 16$--$18$ (0.5--2\,MB
+chunks). Beyond $k = 18$, the gather/scatter kernel working set
+exceeds the CPU's L2 cache (${\sim}4$\,MB per core on Apple Silicon),
+causing a ${\sim}3\times$ slowdown that outweighs the reduction in
+I/O passes. Gate fusion consistently provides a 10--40\% speedup
+by merging consecutive local levels and pre-multiplying single-qubit
+gate matrices. The pipeline runner offers a 10--15\% improvement over
+the sequential runner at the optimal chunk size.
+
+\subsection{Crash Recovery}
+\label{sec:recovery-eval}
+
+We evaluate recovery correctness under simulated fail-stop failures.
+Crashes are injected by terminating the runner subprocess
+(via \texttt{os.\_exit}) at controlled points: after initialisation,
+after writing a subset of chunks, and after completing a full step
+but before WAL commit. In each case, the recovery procedure reads
+the WAL, identifies the committed buffer, wipes the (potentially
+corrupted) destination buffer, and resumes from the last committed
+step. Across 12 dedicated recovery tests, the final state after
+recovery matches the fault-free reference in all cases. At most
+one step of work is lost per crash, bounded by the step-level WAL
+granularity.
+
+\subsection{Summary}
+\label{sec:results-summary}
+
+The current implementation (v4) demonstrates:
+(i)~correctness against two independent oracles across 147 circuit
+instances spanning 3--20 qubits and up to 395\,059 gates;
+(ii)~a $300$--$10\,000\times$ speedup over the Spark DataFrame
+approach (v3) by moving the numeric kernel out of the Spark execution
+path;
+(iii)~out-of-core scaling to $n = 30$ (over $10^9$ amplitudes, 17\,GB
+on disk) on a single machine with bounded memory footprint;
+(iv)~empirically tuned chunk size ($2^{16}$--$2^{18}$) that balances
+cache efficiency against I/O pass count; and
+(v)~atomic, crash-recoverable progress via double-buffered storage
+with a step-level write-ahead log.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{hai2025cqms}
+Rihan Hai, Shih-Han Hung, Tim Coopmans, Tim Littau, and Floris Geerts.\\
+\newblock Quantum Data Management in the NISQ Era.\\
+\newblock \emph{Proceedings of the VLDB Endowment}, 18(6):1720--1729, February 2025.\\
+\newblock \href{https://doi.org/10.14778/3725688.3725701}{doi:10.14778/3725688.3725701}.
+
+\bibitem{wang2021quantum}
+Zhimin Wang, Zhaoyun Chen, Shengbin Wang, Wendong Li, Yongjian Gu, Guoping Guo, and Zhiqiang Wei.\\
+\newblock A quantum circuit simulator and its applications on Sunway TaihuLight supercomputer.\\
+\newblock \emph{Scientific Reports}, 11(1):355, 2021.\\
+\newblock \href{https://doi.org/10.1038/s41598-020-79777-y}{doi:10.1038/s41598-020-79777-y}.
+
+\bibitem{jones2019quest}
+Tyson Jones, Anna Brown, Ian Bush, and Simon C. Benjamin.
+\newblock QuEST and high performance simulation of quantum computers.
+\newblock \emph{Scientific Reports}, 9(1):10736, 2019.
+\newblock \href{https://doi.org/10.1038/s41598-019-47174-9}{doi:10.1038/s41598-019-47174-9}.
+
+\bibitem{guerreschi2020intel}
+Gian Giacomo Guerreschi, Justin Hogaboam, Fabio Baruffa, and Nicolas P. D. Sawaya.
+\newblock Intel Quantum Simulator: A cloud-ready high-performance simulator of quantum circuits.
+\newblock \emph{Quantum Science and Technology}, 5(3):034007, 2020.
+\newblock \href{https://doi.org/10.1088/2058-9565/ab8505}{doi:10.1088/2058-9565/ab8505}.
+
+\bibitem{fang2022hisvsim}
+Bo Fang, M. Yusuf \"{O}zkaya, Ang Li, \"{U}mit V. \c{C}ataly\"{u}rek, and Sriram Krishnamoorthy.
+\newblock Efficient Hierarchical State Vector Simulation of Quantum Circuits via Acyclic Graph Partitioning.
+\newblock In \emph{2022 IEEE International Conference on Cluster Computing (CLUSTER)}, pages 289--300. IEEE, 2022.
+\newblock \href{https://doi.org/10.1109/CLUSTER51413.2022.00041}{doi:10.1109/CLUSTER51413.2022.00041}.
+
+\bibitem{cambiucci2024hypergraphic}
+Waldemir Cambiucci, Regina Melo Silveira, and Wilson Vicente Ruggiero.
+\newblock Hypergraphic partitioning for spatial and temporal quantum circuit cutting.
+\newblock In \emph{2024 IEEE International Conference on Quantum Computing and Engineering (QCE)}, pages 486--487. IEEE, 2024.
+\newblock \href{https://doi.org/10.1109/QCE60285.2024.10368}{doi:10.1109/QCE60285.2024.10368}.
+
+\bibitem{gu2015marlin}
+Rong Gu, Yin Hu, and Yihua Huang.
+\newblock Marlin: A fast and scalable distributed matrix multiplication library on Spark.
+\newblock In \emph{2015 IEEE International Conference on Big Data (Big Data)}, pages 2539--2552. IEEE, 2015.
+\newblock \href{https://doi.org/10.1109/BigData.2015.7364023}{doi:10.1109/BigData.2015.7364023}.
+
+\bibitem{gittens2016matrix}
+Alex Gittens et al.
+\newblock Matrix factorizations at scale: a comparison of scientific data analytics in Spark and C+MPI using three case studies.
+\newblock In \emph{2016 IEEE International Conference on Big Data (Big Data)}, pages 204--213. IEEE, 2016.
+\newblock \href{https://doi.org/10.1109/BigData.2016.7840606}{doi:10.1109/BigData.2016.7840606}.
+
+\bibitem{sun2025accelerating}
+Wenbo Sun, Asterios Katsifodimos, and Rihan Hai.
+\newblock Accelerating machine learning queries with linear algebra query processing.
+\newblock \emph{Distributed and Parallel Databases}, 43:8, 2025.
+\newblock \href{https://doi.org/10.1007/s10619-024-07451-7}{doi:10.1007/s10619-024-07451-7}.
+
+\bibitem{gonthier2025scheduler}
+Maxime Gonthier, Loris Marchal, and Samuel Thibault.
+\newblock A scheduler to foster data locality for GPU and out-of-core task-based linear algebra applications.
+\newblock \emph{Journal of Parallel and Distributed Computing}, 206:105170, August 2025.
+\newblock \href{https://doi.org/10.1016/j.jpdc.2025.105170}{doi:10.1016/j.jpdc.2025.105170}.
+
+\bibitem{toledo1999survey}
+Sivan Toledo.
+\newblock A survey of out-of-core algorithms in numerical linear algebra.
+\newblock In \emph{External Memory Algorithms}, volume 50 of \emph{DIMACS Series in Discrete Mathematics and Theoretical Computer Science}, pages 161--179. American Mathematical Society, 1999.
+\newblock \href{https://doi.org/10.1090/dimacs/050}{doi:10.1090/dimacs/050}.
+
+\bibitem{mohan1992aries}
+C. Mohan, Don Haderle, Bruce Lindsay, Hamid Pirahesh, and Peter Schwarz.
+\newblock ARIES: a transaction recovery method supporting fine-granularity locking and partial rollbacks using write-ahead logging.
+\newblock \emph{ACM Transactions on Database Systems (TODS)}, 17(1):94--162, 1992.
+\newblock \href{https://doi.org/10.1145/128765.128770}{doi:10.1145/128765.128770}.
+
+\bibitem{atlas}
+Mingkuan Xu, Shiyi Cao, Xupeng Miao, Umut A. Acar, and Zhihao Jia.\\
+\newblock Atlas: Hierarchical Partitioning for Quantum Circuit Simulation on GPUs (Extended Version).\\
+\newblock In \emph{Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis (SC '24)}, 2024.\\
+\newblock \href{https://doi.org/10.48550/arXiv.2408.09055}{doi:10.48550/arXiv.2408.09055}.
+
+\bibitem{mqtbench}
+Nils Quetschlich, Lukas Burgholzer, and Robert Wille.
+\newblock MQT Bench: Benchmarking Software and Design Automation Tools for Quantum Computing.
+\newblock \emph{Quantum}, 7:1062, 2023.
+\newblock \href{https://doi.org/10.22331/q-2023-07-20-1062}{doi:10.22331/q-2023-07-20-1062}.
+
+\end{thebibliography}

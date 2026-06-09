@@ -49,10 +49,13 @@ considered valid iff its `manifest.json` exists and passes validation.
 
 ## Atomic commit protocol
 
-1. Write each chunk via temp file + `fsync` + `os.replace`
+1. Write each chunk via temp file + `os.replace` (note: chunks are **not** fsynced before rename — only the metadata files are)
 2. Write `manifest.json.tmp`, `fsync`, `os.replace` to `manifest.json`
-3. Update `wal.json` atomically to flip `committed_buf`
+3. Update `wal.json` atomically (`tmp` → `fsync` → `os.replace`) to flip `committed_buf`
 
 The source buffer is **never modified** during a step — only the
-destination buffer is written to.  On crash, recovery wipes the
-destination and re-runs from the intact source.
+destination buffer is written to.  On crash, recovery reads
+`done_steps` and `committed_buf` from the WAL and resumes from that
+step.  The destination buffer from the crashed step gets fully
+overwritten during the re-run — no explicit wipe is needed because
+every chunk in the destination is written before the WAL commits.

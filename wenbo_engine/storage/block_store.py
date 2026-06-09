@@ -20,11 +20,9 @@ def write_chunk_atomic(path: str | Path, data: np.ndarray) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".tmp")
-    buf = np.ascontiguousarray(data, dtype=DTYPE).tobytes()
+    arr = np.ascontiguousarray(data, dtype=DTYPE)
     with open(tmp, "wb") as f:
-        f.write(buf)
-        f.flush()
-        os.fsync(f.fileno())
+        arr.tofile(f)
     os.replace(str(tmp), str(p))
 
 

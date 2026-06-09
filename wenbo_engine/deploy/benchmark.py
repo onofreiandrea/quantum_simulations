@@ -49,7 +49,7 @@ def main():
                         help="Checkpoint every N nonlocal gates (default: 2). "
                              "Lower = less lost work on crash, more I/O.")
     parser.add_argument("--checkpoint-dir", type=str, default=None,
-                        help="Shared dir for WAL/checkpoints (NFS mount). "
+                        help="Shared dir for WAL/checkpoints (must be on NFS). "
                              "Default: /mnt/nvme/wenbo_data/benchmark_ckpt")
     parser.add_argument("--output", type=str, default="benchmark_results.csv")
     args = parser.parse_args()

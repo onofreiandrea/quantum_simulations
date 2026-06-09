@@ -115,19 +115,22 @@ Since EFS is mounted on all nodes, the code is immediately available everywhere.
 
 ## Step 6: Start Spark Cluster
 
+The master runs Spark master + driver + NFS only — **no executor**.
+Only the 2 worker nodes run executors. This prevents OOM on the master.
+
 ```bash
-# On MASTER:
+# On MASTER (Spark master + NFS only, NO executor):
 ssh -i your-key.pem ubuntu@<master-ip>
 chmod +x /mnt/efs/quantum_simulations/wenbo_engine/deploy/spark_cluster.sh
 /mnt/efs/quantum_simulations/wenbo_engine/deploy/spark_cluster.sh start-master
 # Note the master IP printed
 
-# On EACH WORKER:
+# On EACH WORKER (NOT on master):
 ssh -i your-key.pem ubuntu@<worker-ip>
 /mnt/efs/quantum_simulations/wenbo_engine/deploy/spark_cluster.sh start-worker <master-private-ip>
 ```
 
-Verify at `http://<master-public-ip>:8080` — you should see 3 workers registered.
+Verify at `http://<master-public-ip>:8080` — you should see 2 workers registered.
 
 ## Step 7: Run Simulation
 
