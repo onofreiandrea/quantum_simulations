@@ -1,0 +1,19 @@
+# 4-rank MPI smoke test: GHZ-8 over 16 chunks (4 chunks/rank).
+#   mpirun -np 4 python -m wenbo_engine.experiments.run_experiment --config wenbo_engine/configs/smoke_mpi.yaml
+run_id: smoke_mpi
+runner: mpi
+description: "GHZ-8 across 4 MPI ranks (16 chunks, 4/rank)"
+
+circuit:
+  source: builtin
+  name: ghz
+  n_qubits: 8
+
+chunk_bits: 4        # chunk_size = 2^4 = 16 -> 2^8 / 16 = 16 chunks (>= 4 ranks)
+buffer_depth: 2
+use_wal: true
+
+calibrate: true      # measures real MPI Sendrecv / collective cost under mpirun
+calib_chunks: 4
+
+output_dir: experiments
