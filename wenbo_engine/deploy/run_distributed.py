@@ -106,9 +106,22 @@ def main():
                         help="Shared dir for WAL/checkpoints (default: temp dir)")
     parser.add_argument("--no-wal", action="store_true",
                         help="Disable write-ahead log")
+    parser.add_argument("--recovery", choices=["none", "wal", "generation"],
+                        default=None,
+                        help="Crash-recovery mode. Overrides --no-wal. "
+                             "'generation' requires the MPI runner "
+                             "(python -m wenbo_engine.mpi.mpi_benchmark).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print config and exit without running")
     args = parser.parse_args()
+
+    # Resolve recovery mode (--recovery overrides --no-wal).
+    if args.recovery == "generation":
+        parser.error("--recovery=generation is only supported by the MPI "
+                     "runner: python -m wenbo_engine.mpi.mpi_benchmark "
+                     "--recovery generation")
+    if args.recovery is not None:
+        args.no_wal = (args.recovery == "none")
 
     chunk_size = 1 << args.chunk_size
     n = args.qubits

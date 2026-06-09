@@ -1,0 +1,22 @@
+# Small single-node smoke test: GHZ-6 over 8 chunks, fully profiled.
+#   python -m wenbo_engine.experiments.run_experiment --config wenbo_engine/configs/smoke_local.yaml
+run_id: smoke_local
+runner: single_node
+description: "GHZ-6 single-node smoke test (multi-chunk, multi-step)"
+
+circuit:
+  source: builtin
+  name: ghz
+  n_qubits: 6
+
+chunk_bits: 3        # chunk_size = 2^3 = 8  ->  2^6 / 8 = 8 chunks
+buffer_depth: 2
+kernel: scalar
+use_wal: true
+use_fusion: false
+checksum: true       # exercise the checksum_sec column
+
+calibrate: true
+calib_chunks: 4
+
+output_dir: experiments

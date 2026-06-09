@@ -780,17 +780,39 @@ def run(
     use_wal: bool = True,
     comm: MPI.Comm | None = None,
     buffer_depth: int = 4,
+    recovery: str | None = None,
 ) -> Path:
     """Run a quantum circuit distributed across MPI ranks.
 
     Each rank stores its chunk partition under work_dir/rank_N/.
-    Uses double-buffering + WAL for crash recovery.
+
+    ``recovery`` selects the durability mode:
+      - ``"none"``       : no crash recovery (fastest).
+      - ``"wal"``        : double-buffer + write-ahead log (default; unchanged).
+      - ``"generation"`` : rank manifests + global commit records
+                           (:mod:`wenbo_engine.recovery`).
+    If ``recovery`` is None it is derived from ``use_wal`` for back-compat
+    (``True`` -> ``"wal"``, ``False`` -> ``"none"``).
 
     Returns:
-        Path to this rank's committed state directory (state_a or state_b).
+        Path to this rank's committed state directory.  For wal/none this is
+        ``state_a``/``state_b``; for generation it is the committed ``gen_*``
+        directory.
     """
     if comm is None:
         comm = MPI.COMM_WORLD
+
+    if recovery is None:
+        recovery = "wal" if use_wal else "none"
+    if recovery not in ("none", "wal", "generation"):
+        raise ValueError(f"unknown recovery mode {recovery!r} "
+                         "(expected none|wal|generation)")
+    if recovery == "generation":
+        return _run_generation(circuit_dict, work_dir, chunk_size, comm,
+                               buffer_depth)
+    # none / wal share the double-buffer path; WAL writes are gated below.
+    use_wal = (recovery == "wal")
+
     rank = comm.Get_rank()
     n_ranks = comm.Get_size()
 
@@ -928,7 +950,151 @@ def run(
     return src_dir  # committed state directory
 
 
+# ── generation-based recovery run ──────────────────────────────────────
+
+def _run_generation(circuit_dict: dict, work_dir: str | Path,
+                    chunk_size: int, comm: "MPI.Comm",
+                    buffer_depth: int) -> Path:
+    """Distributed run with generation-based recovery (--recovery=generation).
+
+    Reuses the same compiled steps and :func:`_apply_step` kernel pipeline as
+    WAL mode, but instead of a double buffer + wal.json it writes each step's
+    output into an immutable ``gen_NNNNNN`` directory and commits it through the
+    cluster-wide commit protocol (per-rank manifest + global commit record).
+
+    Generation g == state after g circuit steps; generation 0 is the initial
+    |0...0> state.  Recovery resumes from the newest valid committed generation.
+    """
+    from wenbo_engine.recovery.generation_manager import (
+        GenerationManager, MPICoordinator, gen_dir, gen_chunks_dir,
+    )
+
+    rank = comm.Get_rank()
+    n_ranks = comm.Get_size()
+    assert n_ranks > 0 and (n_ranks & (n_ranks - 1)) == 0, \
+        f"Number of MPI ranks must be power of 2, got {n_ranks}"
+    p = int(math.log2(n_ranks))
+
+    circuit_dict = validate_circuit_dict(circuit_dict)
+    n = circuit_dict["number_of_qubits"]
+    k = int(math.log2(chunk_size))
+    n_chunks_total = 1 << (n - k)
+    n_chunks_per_rank = n_chunks_total // n_ranks
+    n_local_bits = n - k - p
+    assert n_chunks_per_rank >= 1, \
+        f"Not enough chunks ({n_chunks_total}) for {n_ranks} ranks"
+
+    work = Path(work_dir)
+    levels = levelize(circuit_dict)
+    steps = _compile_steps(levels, k, n_local_bits)
+    circ_hash = _circuit_hash(circuit_dict)
+    crash_after = _crash_after_step()
+
+    coord = MPICoordinator(comm)
+    gm = GenerationManager(
+        work, coord, circuit_hash=circ_hash,
+        dtype=str(np.dtype(DTYPE)), chunk_size=chunk_size,
+    )
+    gm.init_run(n_qubits=n, recovery_mode="generation")
+
+    # Resume from newest valid committed generation (None = fresh start).
+    resume_gen = gm.resume_generation()
+
+    if resume_gen is None:
+        # Commit generation 0 = the initial |0...0> state.
+        def _init_writer(cdir: Path):
+            _init_rank_state(rank, cdir, n_chunks_per_rank, chunk_size)
+            return [gm.chunk_record(cdir, ci) for ci in range(n_chunks_per_rank)]
+
+        rec = gm.commit_step(0, -1, _init_writer)
+        if rec is None:
+            raise RuntimeError("failed to commit initial generation 0")
+        cur_gen = 0
+        if rank == 0:
+            log.info("generation recovery: fresh start, committed gen 0 (init)")
+    else:
+        cur_gen = resume_gen
+        if rank == 0:
+            log.info(f"generation recovery: resuming from gen {cur_gen}")
+
+    start_step = cur_gen  # generation g == g completed steps
+
+    if rank == 0:
+        total_mpi_nl = sum(len(s["mpi_nonlocal_ops"]) for s in steps)
+        log.info(f"MPI generation runner: {n}q, {n_ranks} ranks, "
+                 f"{len(steps)} steps ({total_mpi_nl} MPI-nonlocal), "
+                 f"resuming at step {start_step}")
+
+    for step_idx in range(start_step, len(steps)):
+        t0 = time.time()
+        step = steps[step_idx]
+        next_gen = cur_gen + 1
+
+        src_dir = gen_dir(work, rank, cur_gen)
+        dst_dir = gen_dir(work, rank, next_gen)
+        (dst_dir / "chunks").mkdir(parents=True, exist_ok=True)
+
+        # Apply the step: src gen -> dst gen (same kernel path as WAL mode).
+        _apply_step(
+            comm, rank, n_local_bits, src_dir, dst_dir,
+            n_chunks_per_rank, chunk_size, k,
+            step["local_ops"], step["rank_nonlocal_ops"],
+            step["mpi_nonlocal_ops"], buffer_depth,
+        )
+
+        # Chunks are already on disk in dst; the manifest just records them.
+        def _writer(cdir: Path):
+            return [gm.chunk_record(cdir, ci) for ci in range(n_chunks_per_rank)]
+
+        rec = gm.commit_step(next_gen, step_idx, _writer,
+                             parent_generation=cur_gen)
+        if rec is None:
+            raise RuntimeError(
+                f"generation commit aborted at step {step_idx} "
+                f"(gen {next_gen}) — a rank failed to prepare or lineage diverged")
+        cur_gen = next_gen
+
+        # Reclaim old generations (keep newest 3: current + 2 rollback targets).
+        gm.prune(keep_generations=3)
+
+        dt = time.time() - t0
+        if rank == 0:
+            log.info(f"  step {step_idx + 1}/{len(steps)} -> gen {cur_gen} "
+                     f"committed in {dt:.1f}s")
+
+        if crash_after is not None and (step_idx + 1) >= crash_after:
+            if rank == 0:
+                log.info(f"Crash injection after step {step_idx + 1}")
+            comm.Barrier()
+            os._exit(1)
+
+    return gen_dir(work, rank, cur_gen)
+
+
 # ── utilities ──────────────────────────────────────────────────────────
+
+def _committed_chunks_dir(work_dir: Path, rank: int) -> Path:
+    """Locate this rank's committed chunks dir for any recovery mode.
+
+    Generation mode (run.json recovery_mode == "generation") resolves the
+    newest valid committed generation via the recovery scanner; otherwise we
+    fall back to the WAL double-buffer layout (state_a/state_b).
+    """
+    from wenbo_engine.recovery.generation_manager import (
+        read_run_metadata, gen_chunks_dir,
+    )
+    meta = read_run_metadata(work_dir)
+    if meta is not None and meta.recovery_mode == "generation":
+        from wenbo_engine.recovery.recovery_scanner import RecoveryScanner
+        res = RecoveryScanner(work_dir).scan(quarantine=False)
+        if res.generation is not None:
+            return gen_chunks_dir(work_dir, rank, res.generation)
+
+    rank_dir = work_dir / f"rank_{rank}"
+    wal_data = _read_wal(rank_dir / "wal.json")
+    buf = wal_data["committed_buf"] if wal_data else "a"
+    return rank_dir / f"state_{buf}" / "chunks"
+
 
 def compute_norm(work_dir: str | Path,
                  comm: MPI.Comm | None = None) -> float:
@@ -937,11 +1103,7 @@ def compute_norm(work_dir: str | Path,
         comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     work_dir = Path(work_dir)
-    rank_dir = work_dir / f"rank_{rank}"
-
-    wal_data = _read_wal(rank_dir / "wal.json")
-    buf = wal_data["committed_buf"] if wal_data else "a"
-    chunks_dir = rank_dir / f"state_{buf}" / "chunks"
+    chunks_dir = _committed_chunks_dir(work_dir, rank)
 
     local_norm_sq = 0.0
     for chunk_file in sorted(chunks_dir.glob("chunk_*.bin")):
@@ -961,11 +1123,7 @@ def collect_state(work_dir: str | Path,
         comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     work_dir = Path(work_dir)
-    rank_dir = work_dir / f"rank_{rank}"
-
-    wal_data = _read_wal(rank_dir / "wal.json")
-    buf = wal_data["committed_buf"] if wal_data else "a"
-    chunks_dir = rank_dir / f"state_{buf}" / "chunks"
+    chunks_dir = _committed_chunks_dir(work_dir, rank)
 
     local_chunks = sorted(chunks_dir.glob("chunk_*.bin"))
     local_state = np.concatenate(
