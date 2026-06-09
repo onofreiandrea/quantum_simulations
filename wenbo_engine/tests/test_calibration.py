@@ -21,6 +21,19 @@ def test_calibration_run_non_mpi(tmp_path):
     assert model["checksum"]["checksum_throughput_MBps"] > 0
     assert model["mpi"]["available"] is False
 
+    # flat, fixed-unit headline keys (GB/s, ms) required by the artifact spec
+    for k in ("nvme_read_gbps", "nvme_write_gbps", "fsync_ms",
+              "rename_ms", "checksum_gbps"):
+        assert k in model, f"missing flat key {k}"
+    assert model["nvme_read_gbps"] > 0
+    assert model["nvme_write_gbps"] > 0
+    assert model["checksum_gbps"] > 0
+    # MPI unavailable -> explicit nulls, not missing keys
+    assert model["mpi_available"] is False
+    assert model["mpi_sendrecv_gbps"] is None
+    assert model["mpi_barrier_ms"] is None
+    assert model["mpi_allreduce_ms"] is None
+
 
 def test_calibration_write(tmp_path):
     runner = CalibrationRunner(tmp_path, chunk_size=1 << 12, n_chunks=2)

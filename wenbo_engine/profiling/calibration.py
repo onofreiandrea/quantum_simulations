@@ -193,7 +193,35 @@ class CalibrationRunner:
             model["mpi"] = self.measure_mpi()
         else:
             model["mpi"] = {"available": False, "reason": "disabled"}
+        self._add_flat_keys(model)
         return model
+
+    @staticmethod
+    def _add_flat_keys(model: dict) -> None:
+        """Promote the headline numbers to flat, fixed-unit top-level keys.
+
+        Bandwidths in GB/s, latencies in ms.  MPI keys are always present and
+        explicitly ``None`` when MPI is unavailable, so consumers never have to
+        guess whether a missing key means "zero" or "not measured".
+        """
+        nvme = model["nvme"]
+        model["nvme_read_gbps"] = nvme["read_bandwidth_MBps"] / 1000.0
+        model["nvme_write_gbps"] = nvme["write_bandwidth_MBps"] / 1000.0
+        model["fsync_ms"] = model["fsync"]["fsync_sec_per_call"] * 1000.0
+        model["rename_ms"] = model["rename"]["rename_sec_per_call"] * 1000.0
+        model["checksum_gbps"] = model["checksum"]["checksum_throughput_MBps"] / 1000.0
+
+        mpi = model.get("mpi", {})
+        if mpi.get("available"):
+            model["mpi_available"] = True
+            model["mpi_sendrecv_gbps"] = mpi["sendrecv_bandwidth_MBps"] / 1000.0
+            model["mpi_barrier_ms"] = mpi["barrier_sec"] * 1000.0
+            model["mpi_allreduce_ms"] = mpi["allreduce_sec"] * 1000.0
+        else:
+            model["mpi_available"] = False
+            model["mpi_sendrecv_gbps"] = None
+            model["mpi_barrier_ms"] = None
+            model["mpi_allreduce_ms"] = None
 
     def write(self, path: str | Path, include_mpi: bool = True) -> dict:
         model = self.run(include_mpi=include_mpi)
