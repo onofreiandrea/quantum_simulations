@@ -69,6 +69,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import inspect
 import json
 import logging
 import math
@@ -81,6 +82,11 @@ from threading import Lock
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+# Durability modes accepted by --recovery.  "generation" requires the
+# generation-recovery integration (Agent 2) to be merged — mpi_runner.run
+# must accept a ``recovery`` parameter and wenbo_engine.recovery must import.
+RECOVERY_MODES = ("none", "wal", "generation")
 
 # Rank bits reserved by ``rank_nonlocal_heavy`` ONLY when it is not told
 # ``num_ranks``.  When ``num_ranks`` is supplied the reservation is derived
@@ -546,10 +552,16 @@ def _instrument_runner(metrics: Metrics):
 
 # ── run + aggregate ────────────────────────────────────────────────────
 
+def _runner_supports_recovery() -> bool:
+    """True when the merged mpi_runner.run accepts a ``recovery`` parameter."""
+    from wenbo_engine.mpi.mpi_runner import run
+    return "recovery" in inspect.signature(run).parameters
+
+
 def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                  work_dir: str | Path, comm=None, seed: int = 42,
                  use_wal: bool = True, verify: bool = False,
-                 reorder: bool = False,
+                 reorder: bool = False, recovery: str | None = None,
                  output_dir: str | Path | None = None) -> dict:
     """Run a communication workload under instrumentation.
 
@@ -559,6 +571,11 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
     per-rank measured metrics onto rank 0, and (if ``output_dir`` is given)
     writes the standard artifact bundle.  Returns the result dict on rank 0,
     ``None`` elsewhere.
+
+    ``recovery`` selects the durability mode (``none`` / ``wal`` /
+    ``generation``).  ``generation`` requires the generation-recovery
+    integration; if that is not merged a clear ``RuntimeError`` is raised.
+    When ``recovery`` is ``None`` it is derived from ``use_wal`` (back-compat).
     """
     from mpi4py import MPI
     from wenbo_engine.mpi.mpi_runner import run, collect_state, compute_norm
@@ -567,6 +584,12 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     num_ranks = comm.Get_size()
+
+    if recovery is None:
+        recovery = "wal" if use_wal else "none"
+    if recovery not in RECOVERY_MODES:
+        raise ValueError(f"unknown recovery mode {recovery!r} "
+                         f"(expected {'|'.join(RECOVERY_MODES)})")
 
     chunk_size = 1 << chunk_bits
     cd = build_circuit(kind, n, depth, chunk_bits, num_ranks, seed)
@@ -581,7 +604,17 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
     comm.Barrier()
     t0 = time.perf_counter()
     with _instrument_runner(metrics):
-        run(cd, work_dir, chunk_size=chunk_size, use_wal=use_wal, comm=pcomm)
+        if _runner_supports_recovery():
+            run(cd, work_dir, chunk_size=chunk_size, comm=pcomm,
+                recovery=recovery)
+        elif recovery == "generation":
+            raise RuntimeError(
+                "recovery='generation' requires the generation-recovery "
+                "integration (mpi_runner.run has no 'recovery' parameter on "
+                "this branch). Run on a branch that merges Agent 2.")
+        else:
+            run(cd, work_dir, chunk_size=chunk_size, comm=pcomm,
+                use_wal=(recovery == "wal"))
     metrics.stage_time = time.perf_counter() - t0
     comm.Barrier()
 
@@ -615,6 +648,7 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         "chunk_bits": chunk_bits,
         "num_ranks": num_ranks,
         "use_wal": use_wal,
+        "recovery_mode": recovery,
         "reorder_applied": reorder,
         "intended_locality": INTENDED_LOCALITY.get(kind, "unknown"),
         "n_local_bits": runner_cls["n_local_bits"],
@@ -640,7 +674,7 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         result["correct"] = correct
 
     if output_dir is not None:
-        write_artifacts(output_dir, result, cd)
+        write_artifacts(output_dir, result, cd, work_dir=work_dir)
 
     return result
 
@@ -686,18 +720,76 @@ def _git_commit() -> str:
         return "unknown"
 
 
-def write_artifacts(output_dir: str | Path, result: dict, circuit: dict) -> None:
+def _wal_present(work_dir: str | Path | None) -> bool:
+    if work_dir is None:
+        return False
+    return bool(list(Path(work_dir).glob("**/wal.json")))
+
+
+def _recovery_events(work_dir: str | Path | None, recovery: str) -> dict:
+    """Build recovery_events.json content for the active durability mode.
+
+    For ``generation`` the durability point is the *global commit record*
+    (``commits/commit_*.json``); ``source_of_truth`` is reported as
+    ``global_commit_record`` and the recovery scanner's event log is
+    serialized.  For ``wal`` / ``none`` a minimal record naming the WAL (or
+    nothing) as the source of truth is written.
+    """
+    wal_present = _wal_present(work_dir)
+    if recovery != "generation":
+        return {
+            "recovery_mode": recovery,
+            "source_of_truth": "wal_json" if recovery == "wal" else "none",
+            "wal_json_present": wal_present,
+            "crashed": False,
+            "events": [],
+        }
+
+    # generation mode — read the on-disk generation-recovery state.
+    out: dict = {
+        "recovery_mode": "generation",
+        "source_of_truth": "global_commit_record",
+        "wal_json_present": wal_present,
+        "crashed": False,
+        "events": [],
+    }
+    try:
+        from wenbo_engine.recovery import (
+            commits_dir, list_commit_files, read_run_metadata, RecoveryScanner,
+        )
+        wd = Path(work_dir)
+        meta = read_run_metadata(wd)
+        if meta is not None:
+            out["recovery_mode"] = meta.recovery_mode
+            out["n_ranks"] = getattr(meta, "n_ranks", None)
+        commit_files = list_commit_files(commits_dir(wd))
+        out["commits_dir"] = str(commits_dir(wd))
+        out["n_commit_records"] = len(commit_files)
+        out["commit_files"] = [p.name for p in commit_files]
+        res = RecoveryScanner(wd).scan(quarantine=False)
+        out["committed_generation"] = res.generation
+        if res.events is not None:
+            out["events"] = [e.to_dict() for e in res.events]
+    except Exception as e:  # pragma: no cover - defensive
+        out["scan_error"] = repr(e)
+    return out
+
+
+def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
+                    work_dir: str | Path | None = None) -> None:
     """Write the standard experiment artifact bundle (rank-0 only).
 
     Emits config.json, circuit.json, plan.json, cost_model.json,
     stage_profile.csv, mpi_profile.csv, io_profile.csv,
     recovery_events.json, final_summary.json, final_norm.txt,
     git_commit.txt — schema-compatible with wenbo_engine.profiling /
-    wenbo_engine.experiments.summary.
+    wenbo_engine.experiments.summary.  ``work_dir`` is the runner's scratch
+    directory, needed to read the generation-recovery commit state.
     """
     d = Path(output_dir)
     d.mkdir(parents=True, exist_ok=True)
     agg = result["aggregate"]
+    recovery = result.get("recovery_mode", "wal")
 
     # config.json
     (d / "config.json").write_text(json.dumps({
@@ -708,6 +800,7 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict) -> None
         "chunk_bits": result["chunk_bits"],
         "num_ranks": result["num_ranks"],
         "use_wal": result["use_wal"],
+        "recovery_mode": recovery,
         "reorder_applied": result["reorder_applied"],
         "intended_locality": result["intended_locality"],
         "runner": "mpi",
@@ -788,10 +881,9 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict) -> None
     with open(d / "io_profile.csv", "w", newline="") as f:
         csv.DictWriter(f, fieldnames=IO_COLUMNS).writeheader()
 
-    # recovery_events.json — benchmark never injects crashes.
-    (d / "recovery_events.json").write_text(json.dumps({
-        "events": [], "crashed": False, "recovery_mode": "normal",
-    }, indent=2))
+    # recovery_events.json — mode-aware (generation reads the commit state).
+    (d / "recovery_events.json").write_text(
+        json.dumps(_recovery_events(work_dir, recovery), indent=2))
 
     # final_norm.txt
     (d / "final_norm.txt").write_text(f"{result['final_norm']:.12f}\n")
@@ -809,6 +901,7 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict) -> None
         "depth": result["depth"],
         "chunk_bits": result["chunk_bits"],
         "num_ranks": result["num_ranks"],
+        "recovery_mode": recovery,
         "intended_locality": result["intended_locality"],
         "measured_local_ops": result["measured_local_ops"],
         "measured_rank_nonlocal_ops": result["measured_rank_nonlocal_ops"],
@@ -865,13 +958,21 @@ def main(argv: list[str] | None = None) -> None:
                     help="single JSON profile path (legacy)")
     ap.add_argument("--output-dir", type=str, default=None,
                     help="directory for the standard artifact bundle")
-    ap.add_argument("--no-wal", action="store_true", help="disable WAL")
+    ap.add_argument("--no-wal", action="store_true",
+                    help="disable WAL (shorthand for --recovery none)")
+    ap.add_argument("--recovery", choices=list(RECOVERY_MODES), default=None,
+                    help="durability mode: none|wal|generation "
+                         "(generation requires the generation-recovery merge)")
     ap.add_argument("--reorder", action="store_true",
                     help="apply production qubit reordering (DISABLED by "
                          "default so MPI-nonlocal stress is forced)")
     ap.add_argument("--verify", action="store_true",
                     help="collect full state and compare to ref_dense (small n)")
     args = ap.parse_args(argv)
+
+    # --recovery takes precedence; otherwise derive from --no-wal.
+    recovery = args.recovery if args.recovery is not None else (
+        "none" if args.no_wal else "wal")
 
     chunk_bits = args.chunk_bits
     if chunk_bits is None:
@@ -882,6 +983,7 @@ def main(argv: list[str] | None = None) -> None:
         log.info("  communication workload: %s", args.kind)
         log.info("  n=%d depth=%d chunk_bits=%d ranks=%d seed=%d",
                  args.n, args.depth, chunk_bits, num_ranks, args.seed)
+        log.info("  recovery: %s", recovery)
         log.info("  reorder: %s", "ON" if args.reorder
                  else "DISABLED (forcing MPI-nonlocal stress)")
         log.info("=" * 60)
@@ -889,7 +991,7 @@ def main(argv: list[str] | None = None) -> None:
     result = run_workload(
         kind=args.kind, n=args.n, depth=args.depth, chunk_bits=chunk_bits,
         work_dir=args.work_dir, comm=comm, seed=args.seed,
-        use_wal=not args.no_wal, verify=args.verify, reorder=args.reorder,
+        verify=args.verify, reorder=args.reorder, recovery=recovery,
         output_dir=args.output_dir,
     )
 
@@ -910,6 +1012,7 @@ def main(argv: list[str] | None = None) -> None:
         log.info("  kernel_time               : %.4fs", agg["kernel_time"])
         log.info("  stage_time                : %.4fs", agg["stage_time"])
         log.info("  final_norm                : %.10f", result["final_norm"])
+        log.info("  recovery_mode             : %s", result["recovery_mode"])
         if "correct" in result:
             log.info("  correct (vs ref_dense)    : %s", result["correct"])
 

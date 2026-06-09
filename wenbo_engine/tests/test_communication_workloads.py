@@ -40,6 +40,20 @@ except ImportError:
 mpi_required = pytest.mark.skipif(
     not (HAS_MPI and HAS_MPI4PY), reason="mpirun / mpi4py not available")
 
+# generation recovery is only available when Agent 2's integration is merged
+# (mpi_runner.run gains a `recovery` param and wenbo_engine.recovery imports).
+try:
+    from wenbo_engine.mpi.mpi_runner import run as _mpi_run_fn
+    import inspect as _inspect
+    GEN_SUPPORTED = "recovery" in _inspect.signature(_mpi_run_fn).parameters
+    import wenbo_engine.recovery  # noqa: F401
+except Exception:
+    GEN_SUPPORTED = False
+
+generation_required = pytest.mark.skipif(
+    not (HAS_MPI and HAS_MPI4PY and GEN_SUPPORTED),
+    reason="generation-recovery integration not present on this branch")
+
 
 def _all_qubits(cd):
     return [q for g in cd["gates"] for q in g["qubits"]]
@@ -294,3 +308,87 @@ def test_metrics_do_not_leak_between_workloads():
     assert data["heavy"] > 0, "heavy run should have MPI bytes"
     assert data["light"] == 0, f"stale MPI bytes leaked into light run: {data}"
     assert data["light_pairs"] == 0, "stale partner pairs leaked into light run"
+
+
+# ── recovery wiring (mode plumbing, branch-independent) ─────────────────
+
+def test_recovery_events_wal_and_none(tmp_path):
+    """recovery_events content is correct for wal / none without MPI."""
+    # wal: a wal.json present -> wal_json_present True, source_of_truth wal_json
+    (tmp_path / "rank_0").mkdir()
+    (tmp_path / "rank_0" / "wal.json").write_text("{}")
+    ev = cw._recovery_events(tmp_path, "wal")
+    assert ev["recovery_mode"] == "wal"
+    assert ev["source_of_truth"] == "wal_json"
+    assert ev["wal_json_present"] is True
+
+    ev_none = cw._recovery_events(tmp_path / "empty", "none")
+    assert ev_none["recovery_mode"] == "none"
+    assert ev_none["wal_json_present"] is False
+
+
+def test_generation_requires_integration():
+    """Without the Agent-2 merge, generation mode must fail loudly (not silently)."""
+    if cw._runner_supports_recovery():
+        pytest.skip("generation recovery IS supported on this branch")
+    # Build path is exercised only up to the run() call; use size-1 comm.
+    from mpi4py import MPI
+    with pytest.raises(RuntimeError, match="generation"):
+        cw.run_workload("communication_light", n=4, depth=4, chunk_bits=2,
+                        work_dir="/tmp/we_gen_unsupported", comm=MPI.COMM_WORLD,
+                        recovery="generation")
+
+
+# ── 1/8: generation-recovery integration (skipped unless Agent 2 merged) ─
+
+@generation_required
+def test_generation_recovery_full(tmp_path):
+    """mpi_nonlocal_heavy --recovery generation: MPI stress + commit protocol."""
+    adir = tmp_path / "artifacts"
+    work = tmp_path / "work"
+    res, _ = _run_cli(tmp_path, "mpi_nonlocal_heavy", n=6, depth=12,
+                      chunk_bits=3, np_ranks=4, output_dir=adir,
+                      extra=["--recovery", "generation"])
+    # measured MPI traffic
+    assert res["measured_mpi_nonlocal_ops"] > 0
+    assert res["aggregate"]["mpi_bytes_sent"] > 0
+    assert res["aggregate"]["sendrecv_count"] > 0
+    assert res["partner_rank_pairs"] > 0
+    assert abs(res["final_norm"] - 1.0) < 1e-5
+
+    # commit protocol artifacts under work_dir
+    assert (work / "commits").exists(), "commits/ missing"
+    commit_files = list((work / "commits").glob("commit_*.json"))
+    assert commit_files, "no global commit records"
+    manifests = list(work.glob("rank_*/generations/gen_*/manifest.json"))
+    assert manifests, "no rank manifests"
+
+    # recovery_events.json content
+    ev = json.loads((adir / "recovery_events.json").read_text())
+    assert ev["recovery_mode"] == "generation"
+    assert ev["source_of_truth"] == "global_commit_record"
+    assert ev["wal_json_present"] is False
+    assert ev["n_commit_records"] >= 1
+
+    # bundle files
+    for fn in ("final_summary.json", "stage_profile.csv", "mpi_profile.csv"):
+        assert (adir / fn).exists(), fn
+
+
+@generation_required
+def test_generation_light_after_heavy_no_stale(tmp_path):
+    """communication_light --recovery generation: zero MPI, commits still work."""
+    adir = tmp_path / "art_light"
+    work = tmp_path / "work"  # _run_cli uses <tmp>/work as --work-dir
+    res, _ = _run_cli(tmp_path, "communication_light", n=6, depth=12,
+                      chunk_bits=3, np_ranks=4, output_dir=adir,
+                      extra=["--recovery", "generation"])
+    assert res["measured_mpi_nonlocal_ops"] == 0
+    assert res["aggregate"]["mpi_bytes_sent"] == 0
+    assert res["partner_rank_pairs"] == 0
+    assert abs(res["final_norm"] - 1.0) < 1e-5
+    # generation commits still produced even with no MPI traffic
+    assert list((work / "commits").glob("commit_*.json")), "no commits in light run"
+    ev = json.loads((adir / "recovery_events.json").read_text())
+    assert ev["recovery_mode"] == "generation"
+    assert ev["source_of_truth"] == "global_commit_record"
