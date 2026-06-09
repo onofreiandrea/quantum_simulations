@@ -227,15 +227,17 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
                        if result.resumed else []),
         }
     else:
-        norm, wall_mpi = _run_mpi(cfg, circuit, work_dir, chunk_size,
-                                  run_dir, comm, n_ranks, rank)
+        norm, wall_mpi, mpi_recovery = _run_mpi(
+            cfg, circuit, work_dir, chunk_size, run_dir, comm, n_ranks, rank)
         wall = wall_mpi
         recovery = {
             "wal_enabled": cfg.use_wal,
+            "recovery_mode": cfg.resolved_recovery(),
             "crash_env": _crash_env(),
             "note": "MPI per-stage timings are not instrumented; see final_summary.",
             "events": [],
         }
+        recovery.update(mpi_recovery)
 
     # ── final artifacts (rank 0) ───────────────────────────────────────
     if rank == 0:
@@ -248,6 +250,7 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
             "n_gates": len(circuit["gates"]),
             "chunk_size": chunk_size,
             "n_ranks": n_ranks,
+            "recovery_mode": cfg.resolved_recovery(),
             "wall_sec": round(wall, 6),
             "final_norm": norm,
         })
@@ -285,16 +288,35 @@ def _run_mpi(cfg, circuit, work_dir, chunk_size, run_dir, comm, n_ranks, rank):
     its recovery-adjacent step loop), so per-stage *timings* are left at 0 and
     flagged in recovery_events / final_summary.  Op counts, byte estimates,
     the global final norm, and the real MPI calibration ARE recorded.
+
+    Returns ``(norm, wall, recovery_extra)`` where ``recovery_extra`` is merged
+    into the run's recovery_events.json (real scanner events in generation mode).
     """
     from wenbo_engine.mpi import mpi_runner
 
+    mode = cfg.resolved_recovery()
     t0 = time.perf_counter()
     mpi_runner.run(circuit, work_dir, chunk_size=chunk_size,
-                   use_wal=cfg.use_wal, comm=comm,
-                   buffer_depth=cfg.buffer_depth)
+                   comm=comm, buffer_depth=cfg.buffer_depth,
+                   recovery=mode)
     comm.Barrier()
     wall = comm.allreduce(time.perf_counter() - t0, op=__import__("mpi4py").MPI.MAX)
     norm = mpi_runner.compute_norm(work_dir, comm=comm)
+
+    # Generation mode: capture the real recovery-scanner decisions as events,
+    # proving the global commit record (not wal.json) is the source of truth.
+    recovery_extra: dict = {"events": []}
+    if mode == "generation" and rank == 0:
+        from wenbo_engine.recovery import RecoveryScanner
+        sc = RecoveryScanner(work_dir).scan(quarantine=False)
+        recovery_extra = {
+            "recovery_mode": "generation",
+            "source_of_truth": "global_commit_record",
+            "committed_generation": sc.generation,
+            "commits_dir": str(Path(work_dir) / "commits"),
+            "wal_json_present": (Path(work_dir) / f"rank_{rank}" / "wal.json").exists(),
+            "events": [e.to_dict() for e in sc.events],
+        }
 
     if rank == 0:
         plan = compile_plan(circuit, chunk_size, n_ranks)
@@ -313,7 +335,7 @@ def _run_mpi(cfg, circuit, work_dir, chunk_size, run_dir, comm, n_ranks, rank):
         stage.to_csv(run_dir / "stage_profile.csv")
         IOProfiler().to_csv(run_dir / "io_profile.csv")
         MPIProfiler(rank=rank).to_csv(run_dir / "mpi_profile.csv")
-    return norm, wall
+    return norm, wall, recovery_extra
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -325,6 +347,10 @@ def main(argv=None) -> int:
     ap.add_argument("--output-dir", default=None, help="override output_dir")
     ap.add_argument("--no-calibrate", action="store_true",
                     help="skip machine calibration")
+    ap.add_argument("--recovery", choices=["none", "wal", "generation"],
+                    default=None,
+                    help="crash-recovery mode (overrides config; "
+                         "generation requires runner=mpi)")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -332,6 +358,9 @@ def main(argv=None) -> int:
         cfg.output_dir = args.output_dir
     if args.no_calibrate:
         cfg.calibrate = False
+    if args.recovery is not None:
+        cfg.recovery = args.recovery
+        cfg.validate()
 
     run_dir = run_experiment(cfg, run_id=args.run_id)
 

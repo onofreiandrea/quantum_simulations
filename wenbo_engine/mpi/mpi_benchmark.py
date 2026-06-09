@@ -49,6 +49,9 @@ def main():
                         help="JSON output file (default: <work-dir>/results.json)")
     parser.add_argument("--no-reorder", action="store_true",
                         help="Disable qubit reordering optimisation")
+    parser.add_argument("--recovery", choices=["none", "wal", "generation"],
+                        default="wal",
+                        help="Crash-recovery mode (default: wal)")
     args = parser.parse_args()
 
     from wenbo_engine.tests.fixtures.circuits import quest_random
@@ -83,6 +86,7 @@ def main():
         log.info(f"  MPI ranks:     {n_ranks}")
         log.info(f"  Levels:        {total_levels}")
         log.info(f"  Work dir:      {args.work_dir}")
+        log.info(f"  Recovery:      {args.recovery}")
         log.info("=" * 60)
 
     comm.Barrier()
@@ -92,8 +96,8 @@ def main():
         circuit_dict=cd,
         work_dir=args.work_dir,
         chunk_size=chunk_size,
-        use_wal=True,
         comm=comm,
+        recovery=args.recovery,
     )
 
     elapsed = time.time() - t0

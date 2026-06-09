@@ -59,6 +59,10 @@ class ExperimentConfig:
     kernel: str = "scalar"
     use_wal: bool = True
     use_fusion: bool = False
+    # crash-recovery mode: none | wal | generation.  None derives from use_wal
+    # (back-compat: True -> wal, False -> none).  "generation" requires the MPI
+    # runner (wenbo_engine.recovery global commit protocol).
+    recovery: str | None = None
 
     # observability knobs
     checksum: bool = False           # checksum each chunk per stage
@@ -85,6 +89,20 @@ class ExperimentConfig:
             raise ValueError(f"chunk_bits must be >= 0, got {self.chunk_bits}")
         if self.buffer_depth < 1:
             raise ValueError(f"buffer_depth must be >= 1, got {self.buffer_depth}")
+        if self.recovery is not None and self.recovery not in (
+                "none", "wal", "generation"):
+            raise ValueError(
+                f"recovery must be one of none|wal|generation, got {self.recovery!r}")
+        if self.recovery == "generation" and self.runner != "mpi":
+            raise ValueError(
+                "recovery=generation requires runner=mpi "
+                "(generation recovery is implemented in the MPI runner)")
+
+    def resolved_recovery(self) -> str:
+        """Effective recovery mode (derives from use_wal when unset)."""
+        if self.recovery is not None:
+            return self.recovery
+        return "wal" if self.use_wal else "none"
 
     def resolved_chunk_size(self, n_qubits: int) -> int:
         """Final chunk_size, clamped to the full state if it is too large."""
