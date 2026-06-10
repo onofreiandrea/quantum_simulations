@@ -539,15 +539,31 @@ def _instrument_runner(metrics: Metrics):
             return r
         return w
 
+    # The compute-unit overlay resolves read_chunk/write_chunk_atomic in its
+    # own module namespace, so instrument those too (else overlay I/O would be
+    # invisible and byte metrics would be wrong in compute_unit mode).
+    try:
+        from wenbo_engine.runtime import memory_overlay as _ov
+    except Exception:
+        _ov = None
+    ov_saved = {}
+    if _ov is not None:
+        ov_saved = {n: getattr(_ov, n) for n in io_names}
+
     try:
         mr.read_chunk = wrap_read(saved["read_chunk"])
         mr.write_chunk_atomic = wrap_write(saved["write_chunk_atomic"])
         for name in kernel_names:
             setattr(mr, name, wrap_kernel(saved[name]))
+        if _ov is not None:
+            _ov.read_chunk = wrap_read(ov_saved["read_chunk"])
+            _ov.write_chunk_atomic = wrap_write(ov_saved["write_chunk_atomic"])
         yield
     finally:
         for name, fn in saved.items():
             setattr(mr, name, fn)
+        for name, fn in ov_saved.items():
+            setattr(_ov, name, fn)
 
 
 # ── run + aggregate ────────────────────────────────────────────────────
@@ -596,7 +612,9 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                  durable: dict | None = None,
                  planner: str | None = None,
                  mpi_exchange_mode: str = "naive",
-                 storage_layout: str = "chunks") -> dict:
+                 storage_layout: str = "chunks",
+                 execution_mode: str = "step",
+                 compute_unit_min_gates: int = 4) -> dict:
     """Run a communication workload under instrumentation.
 
     Builds the circuit, optionally applies production reordering
@@ -668,7 +686,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         if _runner_supports_recovery():
             run(cd, work_dir, chunk_size=chunk_size, comm=pcomm,
                 recovery=recovery, mpi_exchange_mode=mpi_exchange_mode,
-                storage_layout=storage_layout)
+                storage_layout=storage_layout, execution_mode=execution_mode,
+                compute_unit_min_gates=compute_unit_min_gates)
         elif recovery == "generation":
             raise RuntimeError(
                 "recovery='generation' requires the generation-recovery "
@@ -680,6 +699,16 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                 mpi_exchange_mode=mpi_exchange_mode)
     metrics.stage_time = time.perf_counter() - t0
     comm.Barrier()
+
+    # Compute-unit / overlay profiling (written by the runner in compute_unit
+    # mode); measured, surfaced into the result + final_summary.
+    overlay_metrics = {}
+    om_path = Path(work_dir) / "overlay_metrics.json"
+    if om_path.exists():
+        try:
+            overlay_metrics = json.loads(om_path.read_text())
+        except (OSError, ValueError):
+            overlay_metrics = {}
 
     # Durable R4 (optional): promote committed generations AFTER the run — a
     # separate, explicit step, never during gate execution.  Only valid in
@@ -736,6 +765,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         "planner_mode": planner or "current",
         "mpi_exchange_mode": mpi_exchange_mode,
         "storage_layout": storage_layout,
+        "execution_mode": execution_mode,
+        "overlay_metrics": overlay_metrics,
         "intended_locality": INTENDED_LOCALITY.get(kind, "unknown"),
         "n_local_bits": runner_cls["n_local_bits"],
         "n_steps": runner_cls["n_steps"],
@@ -1036,8 +1067,17 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         "reorder_applied": result["reorder_applied"],
         "mpi_exchange_mode": result.get("mpi_exchange_mode", "naive"),
         "storage_layout": result.get("storage_layout", "chunks"),
+        "execution_mode": result.get("execution_mode", "step"),
         "metrics_are_measured": True,
     }
+    _om = result.get("overlay_metrics") or {}
+    for _kk in ("compute_unit_min_gates", "compute_units_executed",
+                "compute_unit_fallbacks", "avg_gates_per_compute_unit",
+                "gates_per_compute_unit", "overlay_load_count",
+                "overlay_writeback_count", "overlay_bytes_read",
+                "overlay_bytes_written"):
+        if _kk in _om:
+            required[_kk] = _om[_kk]
     if "correct" in result:
         required["correct"] = result["correct"]
     try:
@@ -1116,6 +1156,15 @@ def main(argv: list[str] | None = None) -> None:
                     help="On-disk layout for committed generations: chunks (one "
                          "file per chunk) or extents (pack many chunks into few "
                          "extent files). Generation recovery only.")
+    ap.add_argument("--execution-mode", dest="execution_mode",
+                    choices=["step", "compute_unit"], default="step",
+                    help="step (one read/write pass per circuit step, default) "
+                         "or compute_unit (fuse consecutive local-only steps "
+                         "into a RAM overlay: load once, apply many, write once).")
+    ap.add_argument("--compute-unit-min-gates", dest="compute_unit_min_gates",
+                    type=int, default=4,
+                    help="min local gates to form a compute unit; shorter local "
+                         "runs fall back to the step path (default 4).")
     ap.add_argument("--verify", action="store_true",
                     help="collect full state and compare to ref_dense (small n)")
     ap.add_argument("--durable.enabled", dest="durable_enabled",
@@ -1174,6 +1223,8 @@ def main(argv: list[str] | None = None) -> None:
         output_dir=args.output_dir, durable=durable_cfg, planner=args.planner,
         mpi_exchange_mode=args.mpi_exchange_mode,
         storage_layout=args.storage_layout,
+        execution_mode=args.execution_mode,
+        compute_unit_min_gates=args.compute_unit_min_gates,
     )
 
     if rank == 0:

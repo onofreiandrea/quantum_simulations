@@ -189,6 +189,7 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
         cfg_out["run_id"] = run_id
         cfg_out["planner_mode"] = getattr(cfg, "planner", None) or "current"
         cfg_out["storage_layout"] = getattr(cfg, "storage_layout", "chunks")
+        cfg_out["execution_mode"] = getattr(cfg, "execution_mode", "step")
         (run_dir / "config.json").write_text(json.dumps(cfg_out, indent=2))
         (run_dir / "circuit.json").write_text(json.dumps(circuit, indent=2, default=str))
         if cfg.circuit.source == "qasm" and cfg.circuit.path:
@@ -273,6 +274,7 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
             "n_ranks": n_ranks,
             "recovery_mode": cfg.resolved_recovery(),
             "storage_layout": getattr(cfg, "storage_layout", "chunks"),
+            "execution_mode": getattr(cfg, "execution_mode", "step"),
             "wall_sec": round(wall, 6),
             "final_norm": norm,
         })
@@ -350,7 +352,9 @@ def _run_mpi(cfg, circuit, work_dir, chunk_size, run_dir, comm, n_ranks, rank):
     mpi_runner.run(circuit, work_dir, chunk_size=chunk_size,
                    comm=comm, buffer_depth=cfg.buffer_depth,
                    recovery=mode,
-                   storage_layout=getattr(cfg, "storage_layout", "chunks"))
+                   storage_layout=getattr(cfg, "storage_layout", "chunks"),
+                   execution_mode=getattr(cfg, "execution_mode", "step"),
+                   compute_unit_min_gates=getattr(cfg, "compute_unit_min_gates", 4))
     comm.Barrier()
 
     # Durable R4: promote committed generations to durable storage AFTER the
@@ -526,6 +530,13 @@ def main(argv=None) -> int:
                     help="On-disk layout for committed generations: chunks "
                          "(one file per chunk, default) or extents (pack many "
                          "chunks into few extent files). Generation recovery.")
+    ap.add_argument("--execution-mode", dest="execution_mode",
+                    choices=["step", "compute_unit"], default="step",
+                    help="step (default) or compute_unit (RAM-overlay fusion of "
+                         "consecutive local-only steps). Generation recovery.")
+    ap.add_argument("--compute-unit-min-gates", dest="compute_unit_min_gates",
+                    type=int, default=4,
+                    help="min local gates to form a compute unit (default 4).")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -539,6 +550,8 @@ def main(argv=None) -> int:
     if args.planner is not None:
         cfg.planner = args.planner
     cfg.storage_layout = args.storage_layout
+    cfg.execution_mode = args.execution_mode
+    cfg.compute_unit_min_gates = args.compute_unit_min_gates
     cfg.validate()
 
     run_dir = run_experiment(cfg, run_id=args.run_id)
