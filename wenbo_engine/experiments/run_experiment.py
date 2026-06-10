@@ -187,6 +187,7 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
         (run_dir / "git_commit.txt").write_text(_git_commit())
         cfg_out = cfg.to_dict()
         cfg_out["run_id"] = run_id
+        cfg_out["planner_mode"] = getattr(cfg, "planner", None) or "current"
         (run_dir / "config.json").write_text(json.dumps(cfg_out, indent=2))
         (run_dir / "circuit.json").write_text(json.dumps(circuit, indent=2, default=str))
         if cfg.circuit.source == "qasm" and cfg.circuit.path:
@@ -196,6 +197,25 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
                 pass
         plan = compile_plan(circuit, chunk_size, n_ranks)
         (run_dir / "plan.json").write_text(json.dumps(plan, indent=2))
+
+        # Optimizer-v2 ablation report (deterministic plan metrics for all
+        # modes).  Always written so the data-movement comparison is
+        # available alongside the run; selecting a mode is done via the
+        # --planner CLI flag, which is recorded in config.json.
+        planner_mode = getattr(cfg, "planner", None)
+        try:
+            import math as _math
+            from wenbo_engine.planner import HardwareConfig, ablation_report
+            hw = HardwareConfig(
+                n_qubits=n, chunk_bits=int(_math.log2(chunk_size)),
+                num_ranks=n_ranks, recovery=cfg.resolved_recovery())
+            report = ablation_report(circuit, hw, verify_norm=False)
+            report["selected_mode"] = planner_mode or "current"
+            (run_dir / "ablation_report.json").write_text(
+                json.dumps(report, indent=2, default=str))
+        except Exception as e:  # pragma: no cover - defensive
+            (run_dir / "ablation_report.json").write_text(
+                json.dumps({"error": repr(e)}, indent=2))
 
     # ── calibration (all ranks; MPI parts are collective) ──────────────
     if cfg.calibrate:
@@ -493,6 +513,11 @@ def main(argv=None) -> int:
     ap.add_argument("--durable.interval-generations",
                     dest="durable_interval", type=int, default=None,
                     help="promote every N committed generations (default 5)")
+    ap.add_argument("--planner", default=None,
+                    help="Optimizer-v2 ablation mode recorded in config.json "
+                         "and used to select the ablation_report's mode "
+                         "(current | current_static_reorder | stage_v2 | "
+                         "stage_v2_fusion | stage_v2_placement_fusion)")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -503,6 +528,8 @@ def main(argv=None) -> int:
     if args.recovery is not None:
         cfg.recovery = args.recovery
     _apply_durable_overrides(cfg, args)
+    if args.planner is not None:
+        cfg.planner = args.planner
     cfg.validate()
 
     run_dir = run_experiment(cfg, run_id=args.run_id)
