@@ -1153,19 +1153,32 @@ def _committed_chunks_dir(work_dir: Path, rank: int, comm=None) -> Path:
     from wenbo_engine.recovery.generation_manager import (
         read_run_metadata, gen_chunks_dir,
     )
-    meta = read_run_metadata(work_dir)
-    if meta is not None and meta.recovery_mode == "generation":
-        if comm is not None and comm.Get_size() > 1:
+    multi = comm is not None and comm.Get_size() > 1
+    if multi:
+        # run.json is coordinator-visible only (node-local work_dir), so the
+        # recovery-mode decision MUST be made collectively — otherwise ranks
+        # that can't see run.json would skip the collective scanner while the
+        # coordinator enters it, deadlocking.  Rank 0 reads + broadcasts it.
+        mode = None
+        if comm.Get_rank() == 0:
+            m = read_run_metadata(work_dir)
+            mode = m.recovery_mode if m else None
+        mode = comm.bcast(mode, root=0)
+        if mode == "generation":
             from wenbo_engine.recovery.recovery_scanner import (
                 find_latest_valid_generation_mpi,
             )
             gen = find_latest_valid_generation_mpi(
                 work_dir, comm, quarantine=False).generation
-        else:
+            if gen is not None:
+                return gen_chunks_dir(work_dir, rank, gen)
+    else:
+        meta = read_run_metadata(work_dir)
+        if meta is not None and meta.recovery_mode == "generation":
             from wenbo_engine.recovery.recovery_scanner import RecoveryScanner
             gen = RecoveryScanner(work_dir).scan(quarantine=False).generation
-        if gen is not None:
-            return gen_chunks_dir(work_dir, rank, gen)
+            if gen is not None:
+                return gen_chunks_dir(work_dir, rank, gen)
 
     rank_dir = work_dir / f"rank_{rank}"
     wal_data = _read_wal(rank_dir / "wal.json")
