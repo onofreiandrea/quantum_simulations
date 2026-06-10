@@ -840,6 +840,7 @@ def run(
     mpi_exchange_mode: str = "naive",
     storage_layout: str = "chunks",
     execution_mode: str = "step",
+    compute_unit_min_gates: int = 4,
 ) -> Path:
     """Run a quantum circuit distributed across MPI ranks.
 
@@ -871,7 +872,8 @@ def run(
                                buffer_depth, fault_injector=fault_injector,
                                mpi_exchange_mode=mpi_exchange_mode,
                                storage_layout=storage_layout,
-                               execution_mode=execution_mode)
+                               execution_mode=execution_mode,
+                               compute_unit_min_gates=compute_unit_min_gates)
     # none / wal share the double-buffer path; WAL writes are gated below.
     use_wal = (recovery == "wal")
 
@@ -1051,7 +1053,7 @@ def _extent_pack_records(cdir: Path, n_chunks_per_rank: int, chunk_size: int):
 def _run_compute_units(gm, comm, rank, work, steps, cur_gen,
                        n_chunks_per_rank, chunk_size, k, n_local_bits,
                        buffer_depth, mpi_exchange_mode, storage_layout,
-                       fault_injector) -> int:
+                       fault_injector, min_gates: int = 4) -> int:
     """Execute the circuit as compute units (overlay-fused local runs).
 
     Consecutive local-only steps are fused into one compute unit: each chunk is
@@ -1068,8 +1070,8 @@ def _run_compute_units(gm, comm, rank, work, steps, cur_gen,
     )
     units = build_compute_units(
         steps, rank=rank, n_chunks_per_rank=n_chunks_per_rank, start_gen=0,
-        ram_budget_chunks=0, storage_layout=storage_layout)
-    om = OverlayMetrics()
+        ram_budget_chunks=0, storage_layout=storage_layout, min_gates=min_gates)
+    om = OverlayMetrics(min_gates=min_gates)
     for unit in units:
         if unit.dst_generation <= cur_gen:
             continue                       # already committed (resume)
@@ -1144,7 +1146,8 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
                     buffer_depth: int, fault_injector=None,
                     mpi_exchange_mode: str = "naive",
                     storage_layout: str = "chunks",
-                    execution_mode: str = "step") -> Path:
+                    execution_mode: str = "step",
+                    compute_unit_min_gates: int = 4) -> Path:
     """Distributed run with generation-based recovery (--recovery=generation).
 
     Reuses the same compiled steps and :func:`_apply_step` kernel pipeline as
@@ -1240,7 +1243,7 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
         cur_gen = _run_compute_units(
             gm, comm, rank, work, steps, cur_gen, n_chunks_per_rank,
             chunk_size, k, n_local_bits, buffer_depth, mpi_exchange_mode,
-            storage_layout, fault_injector)
+            storage_layout, fault_injector, min_gates=compute_unit_min_gates)
 
     for step_idx in ([] if execution_mode == "compute_unit"
                      else range(start_step, len(steps))):

@@ -79,7 +79,8 @@ def test_scheduler_fuses_local_runs():
         {"local_ops": [], "rank_nonlocal_ops": [], "mpi_nonlocal_ops": [([5], None)]},
         {"local_ops": [([0], None)], "rank_nonlocal_ops": [], "mpi_nonlocal_ops": []},
     ]
-    units = build_compute_units(steps, rank=0, n_chunks_per_rank=2, start_gen=0)
+    units = build_compute_units(steps, rank=0, n_chunks_per_rank=2, start_gen=0,
+                                min_gates=1)   # min_gates=1: pure fusion grouping
     assert [u.kind for u in units] == ["local", "step", "local"]
     assert units[0].n_steps == 2 and len(units[0].local_ops) == 2   # fused
     assert units[1].kind == "step"
@@ -165,3 +166,52 @@ def test_compute_unit_recovery_extents_gate_aware(tmp_path):
     assert c["recovery_mode"] == "generation"
     assert c.get("execution_mode") == "compute_unit"
     assert c.get("compute_units_executed", 0) >= 1
+
+
+# ── adaptive fallback (min_gates) ───────────────────────────────────────
+
+def _lstep():
+    return {"local_ops": [([0], None)], "rank_nonlocal_ops": [],
+            "mpi_nonlocal_ops": []}
+
+
+def test_adaptive_long_run_fuses():
+    units = build_compute_units([_lstep() for _ in range(5)], rank=0,
+                                n_chunks_per_rank=2, start_gen=0, min_gates=4)
+    assert len(units) == 1 and units[0].kind == "local" and units[0].n_steps == 5
+
+
+def test_adaptive_short_run_falls_back():
+    units = build_compute_units([_lstep() for _ in range(2)], rank=0,
+                                n_chunks_per_rank=2, start_gen=0, min_gates=4)
+    assert [u.kind for u in units] == ["step", "step"]
+    assert all(u.fallback for u in units)
+    # generations still number contiguously
+    assert [u.dst_generation for u in units] == [1, 2]
+
+
+def test_min_gates_boundary():
+    u4 = build_compute_units([_lstep() for _ in range(4)], rank=0,
+                             n_chunks_per_rank=1, start_gen=0, min_gates=4)
+    assert len(u4) == 1 and u4[0].kind == "local"           # exactly N fuses
+    u3 = build_compute_units([_lstep() for _ in range(3)], rank=0,
+                             n_chunks_per_rank=1, start_gen=0, min_gates=4)
+    assert all(u.kind == "step" and u.fallback for u in u3)  # N-1 falls back
+
+
+def test_default_execution_mode_is_step():
+    import inspect
+    from wenbo_engine.mpi.mpi_runner import run
+    p = inspect.signature(run).parameters
+    assert p["execution_mode"].default == "step"
+    assert p["compute_unit_min_gates"].default == 4
+
+
+@_mark
+def test_mixed_staged_uses_fallback_not_tiny_units(tmp_path):
+    # mixed_staged interleaves nonlocal steps → short local runs must fall back
+    c = _bench("compute_unit", tmp_path, kind="mixed_staged", n=8, depth=16,
+               layout="extents", exch="gate_aware")
+    assert abs(c["final_norm"] - 1.0) < 1e-5
+    assert c.get("compute_unit_fallbacks", 0) >= 1   # fallback engaged
+    assert c.get("execution_mode") == "compute_unit"

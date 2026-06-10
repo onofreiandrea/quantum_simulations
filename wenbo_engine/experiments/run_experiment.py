@@ -353,7 +353,8 @@ def _run_mpi(cfg, circuit, work_dir, chunk_size, run_dir, comm, n_ranks, rank):
                    comm=comm, buffer_depth=cfg.buffer_depth,
                    recovery=mode,
                    storage_layout=getattr(cfg, "storage_layout", "chunks"),
-                   execution_mode=getattr(cfg, "execution_mode", "step"))
+                   execution_mode=getattr(cfg, "execution_mode", "step"),
+                   compute_unit_min_gates=getattr(cfg, "compute_unit_min_gates", 4))
     comm.Barrier()
 
     # Durable R4: promote committed generations to durable storage AFTER the
@@ -533,6 +534,9 @@ def main(argv=None) -> int:
                     choices=["step", "compute_unit"], default="step",
                     help="step (default) or compute_unit (RAM-overlay fusion of "
                          "consecutive local-only steps). Generation recovery.")
+    ap.add_argument("--compute-unit-min-gates", dest="compute_unit_min_gates",
+                    type=int, default=4,
+                    help="min local gates to form a compute unit (default 4).")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -547,6 +551,7 @@ def main(argv=None) -> int:
         cfg.planner = args.planner
     cfg.storage_layout = args.storage_layout
     cfg.execution_mode = args.execution_mode
+    cfg.compute_unit_min_gates = args.compute_unit_min_gates
     cfg.validate()
 
     run_dir = run_experiment(cfg, run_id=args.run_id)

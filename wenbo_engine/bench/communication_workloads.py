@@ -613,7 +613,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                  planner: str | None = None,
                  mpi_exchange_mode: str = "naive",
                  storage_layout: str = "chunks",
-                 execution_mode: str = "step") -> dict:
+                 execution_mode: str = "step",
+                 compute_unit_min_gates: int = 4) -> dict:
     """Run a communication workload under instrumentation.
 
     Builds the circuit, optionally applies production reordering
@@ -685,7 +686,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         if _runner_supports_recovery():
             run(cd, work_dir, chunk_size=chunk_size, comm=pcomm,
                 recovery=recovery, mpi_exchange_mode=mpi_exchange_mode,
-                storage_layout=storage_layout, execution_mode=execution_mode)
+                storage_layout=storage_layout, execution_mode=execution_mode,
+                compute_unit_min_gates=compute_unit_min_gates)
         elif recovery == "generation":
             raise RuntimeError(
                 "recovery='generation' requires the generation-recovery "
@@ -1069,8 +1071,11 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         "metrics_are_measured": True,
     }
     _om = result.get("overlay_metrics") or {}
-    for _kk in ("compute_units_executed", "gates_per_compute_unit",
-                "overlay_load_count", "overlay_writeback_count"):
+    for _kk in ("compute_unit_min_gates", "compute_units_executed",
+                "compute_unit_fallbacks", "avg_gates_per_compute_unit",
+                "gates_per_compute_unit", "overlay_load_count",
+                "overlay_writeback_count", "overlay_bytes_read",
+                "overlay_bytes_written"):
         if _kk in _om:
             required[_kk] = _om[_kk]
     if "correct" in result:
@@ -1156,6 +1161,10 @@ def main(argv: list[str] | None = None) -> None:
                     help="step (one read/write pass per circuit step, default) "
                          "or compute_unit (fuse consecutive local-only steps "
                          "into a RAM overlay: load once, apply many, write once).")
+    ap.add_argument("--compute-unit-min-gates", dest="compute_unit_min_gates",
+                    type=int, default=4,
+                    help="min local gates to form a compute unit; shorter local "
+                         "runs fall back to the step path (default 4).")
     ap.add_argument("--verify", action="store_true",
                     help="collect full state and compare to ref_dense (small n)")
     ap.add_argument("--durable.enabled", dest="durable_enabled",
@@ -1215,6 +1224,7 @@ def main(argv: list[str] | None = None) -> None:
         mpi_exchange_mode=args.mpi_exchange_mode,
         storage_layout=args.storage_layout,
         execution_mode=args.execution_mode,
+        compute_unit_min_gates=args.compute_unit_min_gates,
     )
 
     if rank == 0:

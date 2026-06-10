@@ -38,6 +38,8 @@ class MemoryOverlay:
         # profiling
         self.load_count = 0
         self.writeback_count = 0
+        self.bytes_read = 0
+        self.bytes_written = 0
 
     # ── load / access ────────────────────────────────────────────────────
     def get(self, chunk_id: int) -> np.ndarray:
@@ -49,6 +51,7 @@ class MemoryOverlay:
         arr = read_chunk(self.src / chunk_filename(chunk_id))
         self._resident[chunk_id] = arr
         self.load_count += 1
+        self.bytes_read += int(arr.nbytes)
         return arr
 
     def mark_dirty(self, chunk_id: int) -> None:
@@ -67,10 +70,11 @@ class MemoryOverlay:
         """Write one dirty chunk back to the destination, once."""
         if chunk_id not in self._dirty:
             return
-        write_chunk_atomic(self.dst / chunk_filename(chunk_id),
-                           self._resident[chunk_id])
+        arr = self._resident[chunk_id]
+        write_chunk_atomic(self.dst / chunk_filename(chunk_id), arr)
         self._dirty.discard(chunk_id)
         self.writeback_count += 1
+        self.bytes_written += int(arr.nbytes)
 
     def flush(self) -> None:
         """Write back every dirty chunk (once each)."""

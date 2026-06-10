@@ -30,6 +30,7 @@ class ComputeUnit:
     ram_budget_chunks: int = 0
     storage_layout: str = "chunks"
     recovery_boundary: bool = True  # every unit boundary is a commit/recovery point
+    fallback: bool = False          # a short local run executed via the step path
 
     @property
     def gate_count(self) -> int:
