@@ -265,6 +265,10 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
     if rank == 0:
         (run_dir / "final_norm.txt").write_text(f"{norm:.12f}\n")
         (run_dir / "recovery_events.json").write_text(json.dumps(recovery, indent=2))
+        from wenbo_engine.bench.communication_workloads import (
+            circuit_clifford_stats,
+        )
+        clifford = circuit_clifford_stats(circuit)
         summary_mod.write_summary(run_dir, extra={
             "run_id": run_id,
             "runner": cfg.runner,
@@ -275,6 +279,11 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
             "recovery_mode": cfg.resolved_recovery(),
             "storage_layout": getattr(cfg, "storage_layout", "chunks"),
             "execution_mode": getattr(cfg, "execution_mode", "step"),
+            "is_stabilizer": clifford["is_stabilizer"],
+            "total_gate_count": clifford["total_gate_count"],
+            "clifford_gate_count": clifford["clifford_gate_count"],
+            "non_clifford_gate_count": clifford["non_clifford_gate_count"],
+            "non_clifford_gate_types": clifford["non_clifford_gate_types"],
             "wall_sec": round(wall, 6),
             "final_norm": norm,
         })

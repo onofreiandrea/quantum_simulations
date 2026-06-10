@@ -133,6 +133,37 @@ def _two(rng: np.random.RandomState, qa: int, qb: int) -> dict:
     return {"qubits": [qa, qb], "gate": g}
 
 
+# ── non-Clifford injection ─────────────────────────────────────────────
+#
+# CNOT/CZ/H/S are Clifford; a circuit built only from them is a *stabilizer*
+# circuit (efficiently classically simulable via Gottesman–Knill), which is a
+# weak stress test for a full state-vector engine.  We deliberately seed every
+# workload with non-Clifford gates so the simulated state is genuinely
+# non-stabilizer, while preserving each workload's intended locality class.
+#
+# Non-Clifford primitives used:
+#   * RX/RY/RZ(θ), θ ∉ (π/2)ℤ   — arbitrary rotations (non-Clifford); already
+#                                 present in ``communication_light``
+#   * CR(k), k ≥ 2              — controlled phase 2π/2^k; only k=1 (CZ) is
+#                                 Clifford, k≥2 (controlled-S, controlled-T, …)
+#                                 is non-Clifford
+#
+# ``_NONCLIFFORD_EVERY`` = 3 makes ~1/3 of a workload's gates non-Clifford on a
+# fixed, deterministic cadence (so at least one appears for any depth ≥ 1).
+_NONCLIFFORD_EVERY = 3
+
+
+def _nonclifford_two(rng: np.random.RandomState, qa: int, qb: int) -> dict:
+    """A guaranteed non-Clifford 2-qubit entangler (CR with k ≥ 3) on qa, qb.
+
+    Same two-qubit structure as :func:`_two` (a controlled phase on the same
+    qubit pair), so it preserves the locality class of the gate it replaces
+    while making the operation non-Clifford.
+    """
+    assert qa != qb, "2q gate needs distinct qubits"
+    return {"qubits": [qa, qb], "gate": "CR", "params": {"k": int(rng.choice([3, 4, 5]))}}
+
+
 def _pick(rng: np.random.RandomState, lo: int, hi: int, exclude: int | None = None) -> int:
     """Random qubit in [lo, hi); raises if the range is empty after exclusion."""
     if hi <= lo:
@@ -199,10 +230,17 @@ def rank_nonlocal_heavy(n: int, depth: int, chunk_bits: int,
             f"(got n={n}, chunk_bits={k}, p={p})")
     rng = np.random.RandomState(seed)
     gates: list[dict] = []
-    for _ in range(depth):
+    for i in range(depth):
         local_q = _pick(rng, 0, k)
         chunk_q = _pick(rng, k, hi)
-        gates.append(_two(rng, local_q, chunk_q))
+        # Every gate is a 2-qubit entangler on a (local, chunk-bit) pair, so the
+        # rank-nonlocal class is preserved.  ~1/3 (the _NONCLIFFORD_EVERY
+        # cadence) are non-Clifford controlled phases on the SAME pair, so the
+        # non-Clifford content is mixed directly into the chunk-bit interactions.
+        if i % _NONCLIFFORD_EVERY == 0:
+            gates.append(_nonclifford_two(rng, local_q, chunk_q))
+        else:
+            gates.append(_two(rng, local_q, chunk_q))
     return {"number_of_qubits": n, "gates": gates}
 
 
@@ -226,10 +264,18 @@ def mpi_nonlocal_heavy(n: int, depth: int, chunk_bits: int,
             f"(got n={n}, chunk_bits={k}, p={p})")
     rng = np.random.RandomState(seed)
     gates: list[dict] = []
-    for _ in range(depth):
+    for i in range(depth):
         rank_q = _pick(rng, n - p, n)
         local_q = _pick(rng, 0, k)
-        gates.append(_two(rng, rank_q, local_q))
+        # Every gate is a 2-qubit entangler on a (rank-bit, local) pair, so the
+        # MPI-nonlocal stress (count + inter-rank partner structure) is
+        # unchanged.  ~1/3 (the _NONCLIFFORD_EVERY cadence) are non-Clifford
+        # controlled phases on the SAME pair, adding non-Clifford content
+        # without removing any MPI-nonlocal exchange.
+        if i % _NONCLIFFORD_EVERY == 0:
+            gates.append(_nonclifford_two(rng, rank_q, local_q))
+        else:
+            gates.append(_two(rng, rank_q, local_q))
     return {"number_of_qubits": n, "gates": gates}
 
 
@@ -283,6 +329,84 @@ def build_circuit(kind: str, n: int, depth: int, chunk_bits: int,
 def _check_pow2(num_ranks: int) -> None:
     if num_ranks < 1 or (num_ranks & (num_ranks - 1)) != 0:
         raise ValueError(f"num_ranks must be a power of 2, got {num_ranks}")
+
+
+# ── Clifford / stabilizer classification ────────────────────────────────
+
+# Fixed gates that are Clifford (generate the Clifford group with CNOT/CZ).
+_CLIFFORD_FIXED = {"H", "X", "Y", "Z", "S", "SDG", "I",
+                   "CNOT", "CX", "CZ", "CY", "SWAP"}
+# Fixed gates that are NOT Clifford.
+_NONCLIFFORD_FIXED = {"T", "TDG"}
+
+
+def _angle_is_clifford(theta: float) -> bool:
+    """True iff ``theta`` is an integer multiple of π/2 (within tolerance)."""
+    r = theta / (math.pi / 2.0)
+    return abs(r - round(r)) < 1e-9
+
+
+def is_clifford_gate(gate: dict) -> bool:
+    """Whether a single gate entry is a Clifford operation.
+
+    Rotations ``RX/RY/RZ(θ)`` are Clifford only at multiples of π/2.  Phase
+    gates by ``2π/2^k`` differ between the 1- and 2-qubit cases:
+
+      * single-qubit ``R(k)`` = diag(1, e^{2πi/2^k}): R(1)=Z, R(2)=S are
+        Clifford; R(k≥3) (T, …) is non-Clifford → Clifford iff ``k ≤ 2``.
+      * controlled ``CR(k)`` = controlled-R(k): CR(1)=CZ is Clifford, but
+        CR(2)=controlled-S is **non-Clifford** (a controlled-Clifford is not
+        itself Clifford) → Clifford iff ``k ≤ 1``.
+
+    Unknown gate names are treated as non-Clifford (the safe, conservative
+    assumption for a stabilizer test).
+    """
+    name = str(gate["gate"]).upper()
+    if name in _CLIFFORD_FIXED:
+        return True
+    if name in _NONCLIFFORD_FIXED:
+        return False
+    params = gate.get("params") or {}
+    if name in ("RX", "RY", "RZ", "PHASE"):
+        theta = params.get("theta")
+        return theta is not None and _angle_is_clifford(float(theta))
+    if name == "R":
+        # single-qubit phase 2π/2^k: R(1)=Z, R(2)=S are Clifford.
+        k = params.get("k")
+        return k is not None and int(k) <= 2
+    if name == "CR":
+        # controlled phase: only CR(1)=CZ is Clifford; CR(2)=controlled-S is not.
+        k = params.get("k")
+        return k is not None and int(k) <= 1
+    return False
+
+
+def circuit_clifford_stats(circuit_dict: dict) -> dict:
+    """Classify a circuit's gates as Clifford / non-Clifford.
+
+    Returns total / Clifford / non-Clifford counts, the sorted set of
+    non-Clifford gate-type names that appear, and whether the circuit is a
+    stabilizer circuit (Clifford-only).  Used for both the reporting summary
+    and the ``final_summary.json`` stabilizer fields.
+    """
+    gates = circuit_dict.get("gates", [])
+    nc_types: dict[str, int] = {}
+    clifford = 0
+    for g in gates:
+        if is_clifford_gate(g):
+            clifford += 1
+        else:
+            name = str(g["gate"]).upper()
+            nc_types[name] = nc_types.get(name, 0) + 1
+    non_clifford = sum(nc_types.values())
+    return {
+        "total_gate_count": len(gates),
+        "clifford_gate_count": clifford,
+        "non_clifford_gate_count": non_clifford,
+        "non_clifford_gate_types": sorted(nc_types),
+        "non_clifford_gate_type_counts": dict(sorted(nc_types.items())),
+        "is_stabilizer": non_clifford == 0,
+    }
 
 
 def classify_gate(qubits: list[int], k: int, n_local_bits: int) -> str:
@@ -737,6 +861,7 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
     aggregate = _aggregate(all_metrics)
     runner_cls = runner_classification(cd, chunk_bits, num_ranks)
     static = classify_circuit(cd, chunk_bits, num_ranks)
+    clifford = circuit_clifford_stats(cd)
 
     # Deterministic Optimizer-v2 ablation report over the ORIGINAL circuit
     # (before any planner/reorder transform), so all modes compare fairly.
@@ -768,6 +893,13 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         "execution_mode": execution_mode,
         "overlay_metrics": overlay_metrics,
         "intended_locality": INTENDED_LOCALITY.get(kind, "unknown"),
+        # Clifford / stabilizer analysis of the generated circuit
+        "total_gate_count": clifford["total_gate_count"],
+        "clifford_gate_count": clifford["clifford_gate_count"],
+        "non_clifford_gate_count": clifford["non_clifford_gate_count"],
+        "non_clifford_gate_types": clifford["non_clifford_gate_types"],
+        "non_clifford_gate_type_counts": clifford["non_clifford_gate_type_counts"],
+        "is_stabilizer": clifford["is_stabilizer"],
         "n_local_bits": runner_cls["n_local_bits"],
         "n_steps": runner_cls["n_steps"],
         # authoritative counts from the real runner compiler
@@ -1068,6 +1200,12 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         "mpi_exchange_mode": result.get("mpi_exchange_mode", "naive"),
         "storage_layout": result.get("storage_layout", "chunks"),
         "execution_mode": result.get("execution_mode", "step"),
+        # Clifford / stabilizer analysis of the generated circuit
+        "is_stabilizer": result.get("is_stabilizer"),
+        "total_gate_count": result.get("total_gate_count"),
+        "clifford_gate_count": result.get("clifford_gate_count"),
+        "non_clifford_gate_count": result.get("non_clifford_gate_count"),
+        "non_clifford_gate_types": result.get("non_clifford_gate_types"),
         "metrics_are_measured": True,
     }
     _om = result.get("overlay_metrics") or {}
