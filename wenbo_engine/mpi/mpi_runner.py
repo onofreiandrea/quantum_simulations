@@ -839,6 +839,7 @@ def run(
     fault_injector=None,
     mpi_exchange_mode: str = "naive",
     storage_layout: str = "chunks",
+    execution_mode: str = "step",
 ) -> Path:
     """Run a quantum circuit distributed across MPI ranks.
 
@@ -869,7 +870,8 @@ def run(
         return _run_generation(circuit_dict, work_dir, chunk_size, comm,
                                buffer_depth, fault_injector=fault_injector,
                                mpi_exchange_mode=mpi_exchange_mode,
-                               storage_layout=storage_layout)
+                               storage_layout=storage_layout,
+                               execution_mode=execution_mode)
     # none / wal share the double-buffer path; WAL writes are gated below.
     use_wal = (recovery == "wal")
 
@@ -1046,13 +1048,103 @@ def _extent_pack_records(cdir: Path, n_chunks_per_rank: int, chunk_size: int):
     return recs
 
 
+def _run_compute_units(gm, comm, rank, work, steps, cur_gen,
+                       n_chunks_per_rank, chunk_size, k, n_local_bits,
+                       buffer_depth, mpi_exchange_mode, storage_layout,
+                       fault_injector) -> int:
+    """Execute the circuit as compute units (overlay-fused local runs).
+
+    Consecutive local-only steps are fused into one compute unit: each chunk is
+    loaded once, all the unit's gates applied via a RAM overlay, and written
+    back once — fewer read/write passes than per-step.  Steps needing rank/MPI
+    exchange run via the unchanged per-step path.  Every unit commits exactly
+    one generation (the recovery boundary), so generation recovery / extents /
+    gate-aware MPI semantics are preserved.  Returns the final committed gen.
+    """
+    from wenbo_engine.faults.fault_points import FaultPoint
+    from wenbo_engine.recovery.generation_manager import gen_dir
+    from wenbo_engine.runtime import (
+        build_compute_units, execute_local_unit, OverlayMetrics,
+    )
+    units = build_compute_units(
+        steps, rank=rank, n_chunks_per_rank=n_chunks_per_rank, start_gen=0,
+        ram_budget_chunks=0, storage_layout=storage_layout)
+    om = OverlayMetrics()
+    for unit in units:
+        if unit.dst_generation <= cur_gen:
+            continue                       # already committed (resume)
+        t0 = time.time()
+        next_gen = unit.dst_generation
+        src_dir = gen_dir(work, rank, cur_gen)
+        dst_dir = gen_dir(work, rank, next_gen)
+        (dst_dir / "chunks").mkdir(parents=True, exist_ok=True)
+        if storage_layout == "extents":
+            _materialize_source_if_extent(src_dir)
+
+        last_step = unit.step_range[1] - 1
+        fault_injector.maybe_fire(FaultPoint.AFTER_READ, rank, last_step)
+
+        if unit.kind == "local":
+            overlay = execute_local_unit(
+                unit, src_dir / "chunks", dst_dir / "chunks", _apply_local_ops)
+            om.record_unit(unit, overlay)
+        else:
+            s = unit.step
+            _apply_step(comm, rank, n_local_bits, src_dir, dst_dir,
+                        n_chunks_per_rank, chunk_size, k,
+                        s["local_ops"], s["rank_nonlocal_ops"],
+                        s["mpi_nonlocal_ops"], buffer_depth,
+                        mpi_exchange_mode=mpi_exchange_mode)
+            om.record_unit(unit)
+
+        def _writer(cdir, _ls=last_step):
+            if storage_layout == "extents":
+                recs = _extent_pack_records(cdir, n_chunks_per_rank, chunk_size)
+                fault_injector.maybe_fire(FaultPoint.AFTER_PARTIAL_WRITE, rank, _ls)
+                return recs
+            recs = []
+            for ci in range(n_chunks_per_rank):
+                recs.append(gm.chunk_record(cdir, ci))
+                if ci == 0:
+                    fault_injector.maybe_fire(
+                        FaultPoint.AFTER_PARTIAL_WRITE, rank, _ls)
+            return recs
+
+        rec = gm.commit_step(next_gen, last_step, _writer,
+                             parent_generation=cur_gen)
+        if rec is None:
+            raise RuntimeError(
+                f"compute-unit commit aborted at unit {unit.compute_unit_id} "
+                f"(gen {next_gen})")
+        cur_gen = next_gen
+        if storage_layout == "extents":
+            shutil.rmtree(src_dir / "chunks", ignore_errors=True)
+        gm.prune(keep_generations=3)
+        if rank == 0:
+            log.info(f"  compute unit {unit.compute_unit_id} "
+                     f"({unit.kind}, {unit.n_steps} steps, {unit.gate_count} "
+                     f"gates) -> gen {cur_gen} in {time.time() - t0:.1f}s")
+
+    if rank == 0:
+        log.info("overlay metrics: %s", om.to_dict())
+        # Surface compute-unit profiling for the bench/experiment summaries.
+        try:
+            import json as _json
+            (Path(work) / "overlay_metrics.json").write_text(
+                _json.dumps(om.to_dict()))
+        except OSError:
+            pass
+    return cur_gen
+
+
 # ── generation-based recovery run ──────────────────────────────────────
 
 def _run_generation(circuit_dict: dict, work_dir: str | Path,
                     chunk_size: int, comm: "MPI.Comm",
                     buffer_depth: int, fault_injector=None,
                     mpi_exchange_mode: str = "naive",
-                    storage_layout: str = "chunks") -> Path:
+                    storage_layout: str = "chunks",
+                    execution_mode: str = "step") -> Path:
     """Distributed run with generation-based recovery (--recovery=generation).
 
     Reuses the same compiled steps and :func:`_apply_step` kernel pipeline as
@@ -1144,7 +1236,14 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
                  f"{len(steps)} steps ({total_mpi_nl} MPI-nonlocal), "
                  f"resuming at step {start_step}")
 
-    for step_idx in range(start_step, len(steps)):
+    if execution_mode == "compute_unit":
+        cur_gen = _run_compute_units(
+            gm, comm, rank, work, steps, cur_gen, n_chunks_per_rank,
+            chunk_size, k, n_local_bits, buffer_depth, mpi_exchange_mode,
+            storage_layout, fault_injector)
+
+    for step_idx in ([] if execution_mode == "compute_unit"
+                     else range(start_step, len(steps))):
         t0 = time.time()
         step = steps[step_idx]
         next_gen = cur_gen + 1
