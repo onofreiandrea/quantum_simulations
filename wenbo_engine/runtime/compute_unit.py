@@ -58,3 +58,42 @@ def execute_local_unit(unit: ComputeUnit, src_chunks_dir, dst_chunks_dir,
         overlay.mark_dirty(cid)
         overlay.writeback(cid)          # one write per chunk for the whole unit
     return overlay
+
+
+def execute_local_unit_direct(unit: ComputeUnit, src_gen_dir, dst_gen_dir,
+                              src_records, apply_local_ops, *, chunk_size: int,
+                              extent_bytes=None):
+    """Run a local unit reading src extents directly + writing dst extents.
+
+    No chunk files: each chunk is read straight from its source extent slice
+    and the result appended to a destination
+    :class:`~wenbo_engine.storage.extent_store.ExtentWriter`.  Returns
+    ``(overlay, extent_manifest)``; the writer is fsynced/finalized before
+    return so extents are durable prior to manifest publication.
+
+    ``src_records`` maps chunk_id -> a rank-manifest ChunkRecord with
+    ``extent_id`` / ``extent_offset`` / ``size_bytes``.
+    """
+    from wenbo_engine.storage.extent_store import (
+        read_chunk_from_extent, ExtentWriter, DEFAULT_EXTENT_BYTES,
+    )
+    eb = DEFAULT_EXTENT_BYTES if extent_bytes is None else extent_bytes
+    ew = ExtentWriter(dst_gen_dir, chunk_size, extent_bytes=eb)
+
+    def _reader(cid):
+        r = src_records[cid]
+        return read_chunk_from_extent(src_gen_dir, r.extent_id,
+                                      r.extent_offset, r.size_bytes)
+
+    def _writer(cid, arr):
+        ew.append(cid, arr)
+
+    overlay = MemoryOverlay(reader=_reader, writer=_writer,
+                            ram_budget_chunks=unit.ram_budget_chunks)
+    for cid in unit.chunk_ids:
+        arr = overlay.get(cid)
+        apply_local_ops(arr, unit.local_ops)
+        overlay.mark_dirty(cid)
+        overlay.writeback(cid)
+    manifest = ew.finalize()
+    return overlay, manifest

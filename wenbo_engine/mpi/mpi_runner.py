@@ -841,6 +841,7 @@ def run(
     storage_layout: str = "chunks",
     execution_mode: str = "step",
     compute_unit_min_gates: int = 4,
+    extent_io_mode: str = "materialize",
 ) -> Path:
     """Run a quantum circuit distributed across MPI ranks.
 
@@ -873,7 +874,8 @@ def run(
                                mpi_exchange_mode=mpi_exchange_mode,
                                storage_layout=storage_layout,
                                execution_mode=execution_mode,
-                               compute_unit_min_gates=compute_unit_min_gates)
+                               compute_unit_min_gates=compute_unit_min_gates,
+                               extent_io_mode=extent_io_mode)
     # none / wal share the double-buffer path; WAL writes are gated below.
     use_wal = (recovery == "wal")
 
@@ -1053,7 +1055,8 @@ def _extent_pack_records(cdir: Path, n_chunks_per_rank: int, chunk_size: int):
 def _run_compute_units(gm, comm, rank, work, steps, cur_gen,
                        n_chunks_per_rank, chunk_size, k, n_local_bits,
                        buffer_depth, mpi_exchange_mode, storage_layout,
-                       fault_injector, min_gates: int = 4) -> int:
+                       fault_injector, min_gates: int = 4,
+                       extent_io_mode: str = "materialize") -> int:
     """Execute the circuit as compute units (overlay-fused local runs).
 
     Consecutive local-only steps are fused into one compute unit: each chunk is
@@ -1065,8 +1068,10 @@ def _run_compute_units(gm, comm, rank, work, steps, cur_gen,
     """
     from wenbo_engine.faults.fault_points import FaultPoint
     from wenbo_engine.recovery.generation_manager import gen_dir
+    from wenbo_engine.recovery.rank_manifest import RankManifest, ChunkRecord
     from wenbo_engine.runtime import (
-        build_compute_units, execute_local_unit, OverlayMetrics,
+        build_compute_units, execute_local_unit, execute_local_unit_direct,
+        OverlayMetrics,
     )
     units = build_compute_units(
         steps, rank=rank, n_chunks_per_rank=n_chunks_per_rank, start_gen=0,
@@ -1079,38 +1084,62 @@ def _run_compute_units(gm, comm, rank, work, steps, cur_gen,
         next_gen = unit.dst_generation
         src_dir = gen_dir(work, rank, cur_gen)
         dst_dir = gen_dir(work, rank, next_gen)
-        (dst_dir / "chunks").mkdir(parents=True, exist_ok=True)
-        if storage_layout == "extents":
-            _materialize_source_if_extent(src_dir)
-
         last_step = unit.step_range[1] - 1
-        fault_injector.maybe_fire(FaultPoint.AFTER_READ, rank, last_step)
+        direct_local = (storage_layout == "extents"
+                        and extent_io_mode == "direct" and unit.kind == "local")
 
-        if unit.kind == "local":
-            overlay = execute_local_unit(
-                unit, src_dir / "chunks", dst_dir / "chunks", _apply_local_ops)
+        if direct_local:
+            # Read src extents directly + write dst extents directly: no chunk
+            # files materialized or packed.
+            src_man = RankManifest.read(src_dir)
+            src_records = {c.index: c for c in src_man.chunks}
+            fault_injector.maybe_fire(FaultPoint.AFTER_READ, rank, last_step)
+            overlay, ext_man = execute_local_unit_direct(
+                unit, src_dir, dst_dir, src_records, _apply_local_ops,
+                chunk_size=chunk_size)
             om.record_unit(unit, overlay)
-        else:
-            s = unit.step
-            _apply_step(comm, rank, n_local_bits, src_dir, dst_dir,
-                        n_chunks_per_rank, chunk_size, k,
-                        s["local_ops"], s["rank_nonlocal_ops"],
-                        s["mpi_nonlocal_ops"], buffer_depth,
-                        mpi_exchange_mode=mpi_exchange_mode)
-            om.record_unit(unit)
+            _direct_recs = [ChunkRecord(
+                index=ci, filename=chunk_filename(ci),
+                size_bytes=ext_man.records[ci].length,
+                checksum=ext_man.records[ci].checksum,
+                extent_id=ext_man.records[ci].extent_id,
+                extent_offset=ext_man.records[ci].offset)
+                for ci in unit.chunk_ids]
 
-        def _writer(cdir, _ls=last_step):
-            if storage_layout == "extents":
-                recs = _extent_pack_records(cdir, n_chunks_per_rank, chunk_size)
+            def _writer(cdir, _recs=_direct_recs, _ls=last_step):
+                # extents already written + fsynced by ExtentWriter; just record.
                 fault_injector.maybe_fire(FaultPoint.AFTER_PARTIAL_WRITE, rank, _ls)
+                return _recs
+        else:
+            (dst_dir / "chunks").mkdir(parents=True, exist_ok=True)
+            if storage_layout == "extents":
+                _materialize_source_if_extent(src_dir)
+            fault_injector.maybe_fire(FaultPoint.AFTER_READ, rank, last_step)
+            if unit.kind == "local":
+                overlay = execute_local_unit(
+                    unit, src_dir / "chunks", dst_dir / "chunks", _apply_local_ops)
+                om.record_unit(unit, overlay)
+            else:
+                s = unit.step
+                _apply_step(comm, rank, n_local_bits, src_dir, dst_dir,
+                            n_chunks_per_rank, chunk_size, k,
+                            s["local_ops"], s["rank_nonlocal_ops"],
+                            s["mpi_nonlocal_ops"], buffer_depth,
+                            mpi_exchange_mode=mpi_exchange_mode)
+                om.record_unit(unit)
+
+            def _writer(cdir, _ls=last_step):
+                if storage_layout == "extents":
+                    recs = _extent_pack_records(cdir, n_chunks_per_rank, chunk_size)
+                    fault_injector.maybe_fire(FaultPoint.AFTER_PARTIAL_WRITE, rank, _ls)
+                    return recs
+                recs = []
+                for ci in range(n_chunks_per_rank):
+                    recs.append(gm.chunk_record(cdir, ci))
+                    if ci == 0:
+                        fault_injector.maybe_fire(
+                            FaultPoint.AFTER_PARTIAL_WRITE, rank, _ls)
                 return recs
-            recs = []
-            for ci in range(n_chunks_per_rank):
-                recs.append(gm.chunk_record(cdir, ci))
-                if ci == 0:
-                    fault_injector.maybe_fire(
-                        FaultPoint.AFTER_PARTIAL_WRITE, rank, _ls)
-            return recs
 
         rec = gm.commit_step(next_gen, last_step, _writer,
                              parent_generation=cur_gen)
@@ -1147,7 +1176,8 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
                     mpi_exchange_mode: str = "naive",
                     storage_layout: str = "chunks",
                     execution_mode: str = "step",
-                    compute_unit_min_gates: int = 4) -> Path:
+                    compute_unit_min_gates: int = 4,
+                    extent_io_mode: str = "materialize") -> Path:
     """Distributed run with generation-based recovery (--recovery=generation).
 
     Reuses the same compiled steps and :func:`_apply_step` kernel pipeline as
@@ -1215,6 +1245,23 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
     if resume_gen is None:
         # Commit generation 0 = the initial |0...0> state.
         def _init_writer(cdir: Path):
+            if storage_layout == "extents" and extent_io_mode == "direct":
+                # write the initial |0...0> state directly into extents
+                from wenbo_engine.storage.extent_store import ExtentWriter
+                from wenbo_engine.recovery.rank_manifest import ChunkRecord
+                ew = ExtentWriter(cdir.parent, chunk_size)
+                for ci in range(n_chunks_per_rank):
+                    arr = np.zeros(chunk_size, dtype=DTYPE)
+                    if rank == 0 and ci == 0:
+                        arr[0] = 1.0
+                    ew.append(ci, arr)
+                m = ew.finalize()
+                return [ChunkRecord(
+                    index=ci, filename=chunk_filename(ci),
+                    size_bytes=m.records[ci].length, checksum=m.records[ci].checksum,
+                    extent_id=m.records[ci].extent_id,
+                    extent_offset=m.records[ci].offset)
+                    for ci in range(n_chunks_per_rank)]
             _init_rank_state(rank, cdir, n_chunks_per_rank, chunk_size)
             if storage_layout == "extents":
                 return _extent_pack_records(cdir, n_chunks_per_rank, chunk_size)
@@ -1243,7 +1290,8 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
         cur_gen = _run_compute_units(
             gm, comm, rank, work, steps, cur_gen, n_chunks_per_rank,
             chunk_size, k, n_local_bits, buffer_depth, mpi_exchange_mode,
-            storage_layout, fault_injector, min_gates=compute_unit_min_gates)
+            storage_layout, fault_injector, min_gates=compute_unit_min_gates,
+            extent_io_mode=extent_io_mode)
 
     for step_idx in ([] if execution_mode == "compute_unit"
                      else range(start_step, len(steps))):

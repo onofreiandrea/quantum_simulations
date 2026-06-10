@@ -113,6 +113,32 @@ def test_newest_extent_invalid_rolls_back(tmp_path):
     assert res.generation == 0        # rolls back to the valid extent gen
 
 
+# ── direct (ExtentWriter) produces the same on-disk layout as pack ──────
+
+def test_direct_written_extents_match_pack(tmp_path):
+    """ExtentWriter (direct write path) yields the same recoverable extent
+    layout as pack_chunk_files (materialize write path) for identical chunks."""
+    from wenbo_engine.storage.extent_store import ExtentWriter, read_logical_chunk
+    chunks = {ci: np.full(CS, 7.0 + ci, dtype=DTYPE) for ci in range(NC)}
+    # pack path (write chunk files then pack)
+    gp = gen_dir(tmp_path, 0, 0); (gp / "chunks").mkdir(parents=True)
+    for ci in range(NC):
+        write_chunk_atomic(gp / "chunks" / chunk_filename(ci), chunks[ci])
+    man_pack = pack_chunk_files(gp, NC, chunk_size=CS)
+    # direct path (ExtentWriter)
+    gd = gen_dir(tmp_path, 0, 1); gd.mkdir(parents=True)
+    ew = ExtentWriter(gd, CS)
+    for ci in range(NC):
+        ew.append(ci, chunks[ci])
+    man_direct = ew.finalize()
+    # same recorded slices + byte-identical logical chunks
+    for ci in range(NC):
+        assert man_direct.records[ci].length == man_pack.records[ci].length
+        assert man_direct.records[ci].checksum == man_pack.records[ci].checksum
+        assert np.array_equal(read_logical_chunk(gd, man_direct, ci),
+                              read_logical_chunk(gp, man_pack, ci))
+
+
 # ── chunks mode unchanged (regression) ──────────────────────────────────
 
 def test_chunks_mode_still_validates(tmp_path):

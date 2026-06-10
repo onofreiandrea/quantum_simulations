@@ -195,6 +195,83 @@ def reconstruct_extents_from_chunks(gen_dir, records, *,
             pass
 
 
+def read_chunk_from_extent(gen_dir, extent_id: int, offset: int,
+                           length: int) -> np.ndarray:
+    """Read one logical chunk directly from its extent slice (seek + read).
+
+    Direct overlay read path: no materialize-to-chunk-file step.  ``offset`` /
+    ``length`` come from the rank manifest's extent record for the chunk.
+    """
+    path = Path(gen_dir) / EXTENTS_DIRNAME / extent_filename(extent_id)
+    with open(path, "rb") as f:
+        f.seek(offset)
+        raw = f.read(length)
+    if len(raw) != length:
+        raise ValueError(f"extent {extent_id}: short read ({len(raw)} != {length})")
+    return np.frombuffer(raw, dtype=DTYPE).copy()
+
+
+class ExtentWriter:
+    """Streaming, atomic writer for a generation's destination extents.
+
+    Direct overlay write path: chunks are appended (any order) to extent files;
+    each ``append`` records the exact ``(extent_id, offset, length, checksum)``.
+    Extents roll past ``extent_bytes``.  ``finalize`` fsyncs every extent and
+    atomically renames it into place, then returns the sealed ExtentManifest —
+    partial extent data is never published; the generation becomes committed
+    only via the global commit record.
+    """
+
+    def __init__(self, gen_dir, chunk_size: int,
+                 extent_bytes: int = DEFAULT_EXTENT_BYTES):
+        self.edir = Path(gen_dir) / EXTENTS_DIRNAME
+        self.edir.mkdir(parents=True, exist_ok=True)
+        self.chunk_size = chunk_size
+        self.extent_bytes = extent_bytes
+        self.records: dict[int, ExtentChunkRecord] = {}
+        self.extent_id = 0
+        self._f = None
+        self._tmp = None
+        self._off = 0
+        self._open()
+
+    def _open(self):
+        self._tmp = self.edir / (extent_filename(self.extent_id) + ".tmp")
+        self._f = open(self._tmp, "wb")
+        self._off = 0
+
+    def _close(self):
+        if self._f is None:
+            return
+        self._f.flush()
+        os.fsync(self._f.fileno())          # req 4: fsync extent output
+        self._f.close()
+        os.replace(str(self._tmp),
+                   str(self.edir / extent_filename(self.extent_id)))
+        self._f = None
+
+    def append(self, chunk_id: int, arr: np.ndarray) -> ExtentChunkRecord:
+        payload = np.ascontiguousarray(arr, dtype=DTYPE).tobytes()
+        if self._off > 0 and self._off + len(payload) > self.extent_bytes:
+            self._close()
+            self.extent_id += 1
+            self._open()
+        self._f.write(payload)
+        rec = ExtentChunkRecord(chunk_id=chunk_id, extent_id=self.extent_id,
+                                offset=self._off, length=len(payload),
+                                checksum=_sha256_bytes(payload))
+        self.records[chunk_id] = rec
+        self._off += len(payload)
+        return rec
+
+    def finalize(self) -> ExtentManifest:
+        self._close()
+        return ExtentManifest(
+            n_chunks=len(self.records), n_extents=self.extent_id + 1,
+            chunk_size=self.chunk_size, dtype=str(np.dtype(DTYPE)),
+            records=self.records).seal()
+
+
 def read_logical_chunk(gen_dir, manifest: ExtentManifest,
                        chunk_id: int) -> np.ndarray:
     """Read one logical chunk by id from its extent (seek + read length)."""

@@ -190,6 +190,7 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
         cfg_out["planner_mode"] = getattr(cfg, "planner", None) or "current"
         cfg_out["storage_layout"] = getattr(cfg, "storage_layout", "chunks")
         cfg_out["execution_mode"] = getattr(cfg, "execution_mode", "step")
+        cfg_out["extent_io_mode"] = getattr(cfg, "extent_io_mode", "materialize")
         (run_dir / "config.json").write_text(json.dumps(cfg_out, indent=2))
         (run_dir / "circuit.json").write_text(json.dumps(circuit, indent=2, default=str))
         if cfg.circuit.source == "qasm" and cfg.circuit.path:
@@ -265,6 +266,10 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
     if rank == 0:
         (run_dir / "final_norm.txt").write_text(f"{norm:.12f}\n")
         (run_dir / "recovery_events.json").write_text(json.dumps(recovery, indent=2))
+        from wenbo_engine.bench.communication_workloads import (
+            circuit_clifford_stats,
+        )
+        clifford = circuit_clifford_stats(circuit)
         summary_mod.write_summary(run_dir, extra={
             "run_id": run_id,
             "runner": cfg.runner,
@@ -275,6 +280,12 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
             "recovery_mode": cfg.resolved_recovery(),
             "storage_layout": getattr(cfg, "storage_layout", "chunks"),
             "execution_mode": getattr(cfg, "execution_mode", "step"),
+            "extent_io_mode": getattr(cfg, "extent_io_mode", "materialize"),
+            "is_stabilizer": clifford["is_stabilizer"],
+            "total_gate_count": clifford["total_gate_count"],
+            "clifford_gate_count": clifford["clifford_gate_count"],
+            "non_clifford_gate_count": clifford["non_clifford_gate_count"],
+            "non_clifford_gate_types": clifford["non_clifford_gate_types"],
             "wall_sec": round(wall, 6),
             "final_norm": norm,
         })
@@ -354,7 +365,8 @@ def _run_mpi(cfg, circuit, work_dir, chunk_size, run_dir, comm, n_ranks, rank):
                    recovery=mode,
                    storage_layout=getattr(cfg, "storage_layout", "chunks"),
                    execution_mode=getattr(cfg, "execution_mode", "step"),
-                   compute_unit_min_gates=getattr(cfg, "compute_unit_min_gates", 4))
+                   compute_unit_min_gates=getattr(cfg, "compute_unit_min_gates", 4),
+                   extent_io_mode=getattr(cfg, "extent_io_mode", "materialize"))
     comm.Barrier()
 
     # Durable R4: promote committed generations to durable storage AFTER the
@@ -537,6 +549,12 @@ def main(argv=None) -> int:
     ap.add_argument("--compute-unit-min-gates", dest="compute_unit_min_gates",
                     type=int, default=4,
                     help="min local gates to form a compute unit (default 4).")
+    ap.add_argument("--extent-io-mode", dest="extent_io_mode",
+                    choices=["materialize", "direct"], default="materialize",
+                    help="extents + compute_unit only: materialize (default; "
+                         "round-trip through temp chunk files) or direct (read/"
+                         "write logical chunks straight from/to extent slices, "
+                         "no temp chunk files).")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -552,6 +570,7 @@ def main(argv=None) -> int:
     cfg.storage_layout = args.storage_layout
     cfg.execution_mode = args.execution_mode
     cfg.compute_unit_min_gates = args.compute_unit_min_gates
+    cfg.extent_io_mode = args.extent_io_mode
     cfg.validate()
 
     run_dir = run_experiment(cfg, run_id=args.run_id)

@@ -10,7 +10,9 @@ storage layouts are unchanged.
 from __future__ import annotations
 
 from wenbo_engine.runtime.memory_overlay import MemoryOverlay
-from wenbo_engine.runtime.compute_unit import ComputeUnit, execute_local_unit
+from wenbo_engine.runtime.compute_unit import (
+    ComputeUnit, execute_local_unit, execute_local_unit_direct,
+)
 from wenbo_engine.runtime.overlay_scheduler import (
     build_compute_units, OverlayMetrics,
 )
@@ -19,6 +21,7 @@ __all__ = [
     "MemoryOverlay",
     "ComputeUnit",
     "execute_local_unit",
+    "execute_local_unit_direct",
     "build_compute_units",
     "OverlayMetrics",
 ]

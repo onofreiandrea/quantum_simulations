@@ -70,6 +70,41 @@ def test_compute_unit_equals_sequential_steps(tmp_path):
         assert np.allclose(got, expect, atol=1e-6)
 
 
+# ── direct extent overlay equals the materialize overlay path ───────────
+
+def test_compute_unit_direct_equals_materialize(tmp_path):
+    from wenbo_engine.runtime.compute_unit import execute_local_unit_direct
+    from wenbo_engine.storage.extent_store import (
+        write_generation_extents, materialize_to_chunk_files, read_logical_chunk,
+    )
+    from wenbo_engine.recovery import ChunkRecord
+    cs, nc = 8, 4
+    rng = np.random.default_rng(7)
+    chunks = {c: (rng.standard_normal(cs) + 1j * rng.standard_normal(cs)).astype(DTYPE)
+              for c in range(nc)}
+    H = gmod.gate_matrix("H", {}).astype(DTYPE)
+    ops = [([0], H), ([1], H), ([2], H)]                  # all chunk-local (cs=2^3)
+    unit = ComputeUnit(compute_unit_id=0, kind="local", src_generation=0,
+                       dst_generation=1, rank=0,
+                       chunk_ids=list(range(nc)), local_ops=ops)
+    # direct: extents -> overlay -> extents
+    gd = tmp_path / "src"
+    man = write_generation_extents(gd, chunks, chunk_size=cs)
+    recs = {c: ChunkRecord(index=c, filename=chunk_filename(c),
+                           size_bytes=man.records[c].length,
+                           checksum=man.records[c].checksum,
+                           extent_id=man.records[c].extent_id,
+                           extent_offset=man.records[c].offset) for c in range(nc)}
+    _ov, out_man = execute_local_unit_direct(unit, gd, tmp_path / "dd", recs,
+                                             _apply_local_ops, chunk_size=cs)
+    # reference: same kernels applied directly
+    for c in range(nc):
+        expect = chunks[c].copy()
+        _apply_local_ops(expect, ops)
+        got = read_logical_chunk(tmp_path / "dd", out_man, c)
+        assert np.allclose(got, expect, atol=1e-6)
+
+
 # ── scheduler fuses consecutive local-only steps, keeps nonlocal separate ─
 
 def test_scheduler_fuses_local_runs():

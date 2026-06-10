@@ -26,12 +26,22 @@ from wenbo_engine.storage.block_store import (
 
 
 class MemoryOverlay:
-    def __init__(self, src_chunks_dir, dst_chunks_dir,
-                 ram_budget_chunks: int = 0):
-        """``ram_budget_chunks`` <= 0 means unbounded."""
-        self.src = Path(src_chunks_dir)
-        self.dst = Path(dst_chunks_dir)
-        self.dst.mkdir(parents=True, exist_ok=True)
+    def __init__(self, src_chunks_dir=None, dst_chunks_dir=None,
+                 ram_budget_chunks: int = 0, *, reader=None, writer=None):
+        """RAM overlay over logical chunks.
+
+        Chunk-file mode (default): reads from ``src_chunks_dir`` and writes to
+        ``dst_chunks_dir``.  Direct mode: pass ``reader(chunk_id) -> array`` and
+        ``writer(chunk_id, array)`` callables (e.g. extent slice read +
+        :class:`ExtentWriter` append) and the overlay never touches chunk files.
+        ``ram_budget_chunks`` <= 0 means unbounded.
+        """
+        self.src = Path(src_chunks_dir) if src_chunks_dir is not None else None
+        self.dst = Path(dst_chunks_dir) if dst_chunks_dir is not None else None
+        if self.dst is not None:
+            self.dst.mkdir(parents=True, exist_ok=True)
+        self._reader = reader
+        self._writer = writer
         self.budget = int(ram_budget_chunks)
         self._resident: "OrderedDict[int, np.ndarray]" = OrderedDict()
         self._dirty: set[int] = set()
@@ -48,7 +58,10 @@ class MemoryOverlay:
             self._resident.move_to_end(chunk_id)
             return self._resident[chunk_id]
         self._evict_if_needed()
-        arr = read_chunk(self.src / chunk_filename(chunk_id))
+        if self._reader is not None:
+            arr = self._reader(chunk_id)
+        else:
+            arr = read_chunk(self.src / chunk_filename(chunk_id))
         self._resident[chunk_id] = arr
         self.load_count += 1
         self.bytes_read += int(arr.nbytes)
@@ -71,7 +84,10 @@ class MemoryOverlay:
         if chunk_id not in self._dirty:
             return
         arr = self._resident[chunk_id]
-        write_chunk_atomic(self.dst / chunk_filename(chunk_id), arr)
+        if self._writer is not None:
+            self._writer(chunk_id, arr)
+        else:
+            write_chunk_atomic(self.dst / chunk_filename(chunk_id), arr)
         self._dirty.discard(chunk_id)
         self.writeback_count += 1
         self.bytes_written += int(arr.nbytes)
