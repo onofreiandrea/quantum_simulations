@@ -733,7 +733,8 @@ def _apply_step(comm: MPI.Comm, rank: int, n_local_bits: int,
                 n_chunks_per_rank: int, chunk_size: int, k: int,
                 local_ops: list, rank_nonlocal_ops: list,
                 mpi_nonlocal_ops: list,
-                buffer_depth: int = 4) -> None:
+                buffer_depth: int = 4,
+                mpi_exchange_mode: str = "naive") -> None:
     """Apply one simulation step (one levelized layer).
 
     When rank-nonlocal gates touch many distinct nonlocal bits, the
@@ -796,10 +797,31 @@ def _apply_step(comm: MPI.Comm, rank: int, n_local_bits: int,
                            local_ops, buffer_depth, affected)
 
     # Phase 2: MPI-nonlocal gates (update dst in-place)
-    for qs, U in mpi_nonlocal_ops:
-        _apply_mpi_gate(comm, rank, n_local_bits,
-                        dst_dir, n_chunks_per_rank, chunk_size, k,
-                        qs, U)
+    if mpi_exchange_mode == "gate_aware" and mpi_nonlocal_ops:
+        # Batch per-partner exchanges + reuse received remote chunks.  The
+        # per-pair kernel math is identical to the naive path, so the final
+        # state is unchanged; only the number/size of Sendrecv calls differ.
+        # Gates that don't fit the batched fast path fall back to naive.
+        from wenbo_engine.mpi.exchange_planner import plan_stage
+        from wenbo_engine.mpi.exchange_batch import (
+            apply_stage_gate_aware, default_batch_chunks,
+        )
+        from wenbo_engine.mpi.remote_buffer_cache import RemoteBufferCache
+        plan = plan_stage(mpi_nonlocal_ops, rank, k, n_local_bits,
+                          n_chunks_per_rank)
+        cache = RemoteBufferCache()
+        fallback = apply_stage_gate_aware(
+            comm, plan, dst_dir, chunk_size,
+            default_batch_chunks(chunk_size), cache)
+        cache.clear()
+        for ge in fallback:
+            _apply_mpi_gate(comm, rank, n_local_bits, dst_dir,
+                            n_chunks_per_rank, chunk_size, k, ge.qs, ge.U)
+    else:
+        for qs, U in mpi_nonlocal_ops:
+            _apply_mpi_gate(comm, rank, n_local_bits,
+                            dst_dir, n_chunks_per_rank, chunk_size, k,
+                            qs, U)
 
     comm.Barrier()
 
@@ -815,6 +837,7 @@ def run(
     buffer_depth: int = 4,
     recovery: str | None = None,
     fault_injector=None,
+    mpi_exchange_mode: str = "naive",
 ) -> Path:
     """Run a quantum circuit distributed across MPI ranks.
 
@@ -843,7 +866,8 @@ def run(
                          "(expected none|wal|generation)")
     if recovery == "generation":
         return _run_generation(circuit_dict, work_dir, chunk_size, comm,
-                               buffer_depth, fault_injector=fault_injector)
+                               buffer_depth, fault_injector=fault_injector,
+                               mpi_exchange_mode=mpi_exchange_mode)
     # none / wal share the double-buffer path; WAL writes are gated below.
     use_wal = (recovery == "wal")
 
@@ -956,6 +980,7 @@ def run(
             step["rank_nonlocal_ops"],
             step["mpi_nonlocal_ops"],
             buffer_depth,
+            mpi_exchange_mode=mpi_exchange_mode,
         )
 
         # Swap buffers
@@ -988,7 +1013,8 @@ def run(
 
 def _run_generation(circuit_dict: dict, work_dir: str | Path,
                     chunk_size: int, comm: "MPI.Comm",
-                    buffer_depth: int, fault_injector=None) -> Path:
+                    buffer_depth: int, fault_injector=None,
+                    mpi_exchange_mode: str = "naive") -> Path:
     """Distributed run with generation-based recovery (--recovery=generation).
 
     Reuses the same compiled steps and :func:`_apply_step` kernel pipeline as
@@ -1097,6 +1123,7 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
             n_chunks_per_rank, chunk_size, k,
             step["local_ops"], step["rank_nonlocal_ops"],
             step["mpi_nonlocal_ops"], buffer_depth,
+            mpi_exchange_mode=mpi_exchange_mode,
         )
 
         # Chunks are already on disk in dst; the manifest just records them.

@@ -594,7 +594,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                  reorder: bool = False, recovery: str | None = None,
                  output_dir: str | Path | None = None,
                  durable: dict | None = None,
-                 planner: str | None = None) -> dict:
+                 planner: str | None = None,
+                 mpi_exchange_mode: str = "naive") -> dict:
     """Run a communication workload under instrumentation.
 
     Builds the circuit, optionally applies production reordering
@@ -665,7 +666,7 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
     with _instrument_runner(metrics):
         if _runner_supports_recovery():
             run(cd, work_dir, chunk_size=chunk_size, comm=pcomm,
-                recovery=recovery)
+                recovery=recovery, mpi_exchange_mode=mpi_exchange_mode)
         elif recovery == "generation":
             raise RuntimeError(
                 "recovery='generation' requires the generation-recovery "
@@ -673,7 +674,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                 "this branch). Run on a branch that merges Agent 2.")
         else:
             run(cd, work_dir, chunk_size=chunk_size, comm=pcomm,
-                use_wal=(recovery == "wal"))
+                use_wal=(recovery == "wal"),
+                mpi_exchange_mode=mpi_exchange_mode)
     metrics.stage_time = time.perf_counter() - t0
     comm.Barrier()
 
@@ -730,6 +732,7 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         "recovery_mode": recovery,
         "reorder_applied": reorder,
         "planner_mode": planner or "current",
+        "mpi_exchange_mode": mpi_exchange_mode,
         "intended_locality": INTENDED_LOCALITY.get(kind, "unknown"),
         "n_local_bits": runner_cls["n_local_bits"],
         "n_steps": runner_cls["n_steps"],
@@ -910,6 +913,7 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         "recovery_mode": recovery,
         "reorder_applied": result["reorder_applied"],
         "planner_mode": result.get("planner_mode", "current"),
+        "mpi_exchange_mode": result.get("mpi_exchange_mode", "naive"),
         "intended_locality": result["intended_locality"],
         "runner": "mpi",
     }, indent=2))
@@ -1096,6 +1100,11 @@ def main(argv: list[str] | None = None) -> None:
                          "stage_v2_fusion | stage_v2_placement_fusion. "
                          "Writes ablation_report.json and (for reorder/"
                          "placement modes) applies the static transform.")
+    ap.add_argument("--mpi-exchange-mode", dest="mpi_exchange_mode",
+                    choices=["naive", "gate_aware"], default="naive",
+                    help="MPI-nonlocal exchange path: naive (one Sendrecv per "
+                         "chunk per gate) or gate_aware (batch per-partner + "
+                         "reuse received remote chunks).")
     ap.add_argument("--verify", action="store_true",
                     help="collect full state and compare to ref_dense (small n)")
     ap.add_argument("--durable.enabled", dest="durable_enabled",
@@ -1152,6 +1161,7 @@ def main(argv: list[str] | None = None) -> None:
         work_dir=args.work_dir, comm=comm, seed=args.seed,
         verify=args.verify, reorder=args.reorder, recovery=recovery,
         output_dir=args.output_dir, durable=durable_cfg, planner=args.planner,
+        mpi_exchange_mode=args.mpi_exchange_mode,
     )
 
     if rank == 0:
