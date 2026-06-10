@@ -917,6 +917,7 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         "reorder_applied": result["reorder_applied"],
         "planner_mode": result.get("planner_mode", "current"),
         "mpi_exchange_mode": result.get("mpi_exchange_mode", "naive"),
+        "storage_layout": result.get("storage_layout", "chunks"),
         "intended_locality": result["intended_locality"],
         "runner": "mpi",
     }, indent=2))
@@ -1033,6 +1034,8 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         "estimated_partner_rank_pairs": result["estimated_partner_rank_pairs"],
         "final_norm": result["final_norm"],
         "reorder_applied": result["reorder_applied"],
+        "mpi_exchange_mode": result.get("mpi_exchange_mode", "naive"),
+        "storage_layout": result.get("storage_layout", "chunks"),
         "metrics_are_measured": True,
     }
     if "correct" in result:

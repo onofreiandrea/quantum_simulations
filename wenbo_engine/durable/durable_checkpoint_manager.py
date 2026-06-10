@@ -47,6 +47,12 @@ from wenbo_engine.durable.durable_commit import (
 
 log = logging.getLogger(__name__)
 
+# How durable storage handles extent-backed generations in THIS branch:
+# extents are materialized to chunk files and uploaded as chunk files (restore
+# re-packs them).  Correct, but the durable store does NOT yet get the extent
+# file-count reduction.  Surfaced so we never claim durable file-count savings.
+DURABLE_EXTENT_MODE = "materialize_chunks_for_durable"
+
 
 @dataclass
 class DurableConfig:
@@ -155,11 +161,22 @@ class DurableCheckpointManager:
         man = RankManifest.read(gdir)
 
         # Extent-backed generation: unpack to chunk files so the existing
-        # per-chunk upload path works unchanged (durable stores chunk files;
-        # restore re-packs them into the manifest's extent layout).
+        # per-chunk upload path works unchanged.
+        #
+        # LIMITATION (explicit, by design in this branch): durable storage holds
+        # CHUNK files even for extent-backed generations — durable_extent_mode ==
+        # DURABLE_EXTENT_MODE ("materialize_chunks_for_durable").  Promote/restore
+        # of extent generations is CORRECT (restore re-packs to the manifest's
+        # exact extent layout), but the durable store does NOT get the
+        # file-count reduction.  Extent-native durable upload is a future branch;
+        # do not claim durable file-count reduction.
         if any(c.is_extent for c in man.chunks):
             from wenbo_engine.storage.extent_store import materialize_to_chunk_files
             materialize_to_chunk_files(gdir, man.chunks)
+            if self.coord.is_coordinator:
+                log.warning("durable: extent gen %d promoted via %s — durable "
+                            "store holds chunk files (no durable file-count "
+                            "reduction yet)", generation, DURABLE_EXTENT_MODE)
 
         # Upload + verify each chunk file.
         chunk_records: list[DurableFileRecord] = []
