@@ -1138,22 +1138,34 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
 
 # ── utilities ──────────────────────────────────────────────────────────
 
-def _committed_chunks_dir(work_dir: Path, rank: int) -> Path:
+def _committed_chunks_dir(work_dir: Path, rank: int, comm=None) -> Path:
     """Locate this rank's committed chunks dir for any recovery mode.
 
     Generation mode (run.json recovery_mode == "generation") resolves the
     newest valid committed generation via the recovery scanner; otherwise we
     fall back to the WAL double-buffer layout (state_a/state_b).
+
+    With a multi-rank ``comm`` it uses the *distributed* scanner so it works
+    with a node-local work_dir (true multi-node) — each rank validates only its
+    own partition.  Must then be called collectively by every rank.  Without a
+    comm (or size 1) it uses the single-host shared-FS scanner.
     """
     from wenbo_engine.recovery.generation_manager import (
         read_run_metadata, gen_chunks_dir,
     )
     meta = read_run_metadata(work_dir)
     if meta is not None and meta.recovery_mode == "generation":
-        from wenbo_engine.recovery.recovery_scanner import RecoveryScanner
-        res = RecoveryScanner(work_dir).scan(quarantine=False)
-        if res.generation is not None:
-            return gen_chunks_dir(work_dir, rank, res.generation)
+        if comm is not None and comm.Get_size() > 1:
+            from wenbo_engine.recovery.recovery_scanner import (
+                find_latest_valid_generation_mpi,
+            )
+            gen = find_latest_valid_generation_mpi(
+                work_dir, comm, quarantine=False).generation
+        else:
+            from wenbo_engine.recovery.recovery_scanner import RecoveryScanner
+            gen = RecoveryScanner(work_dir).scan(quarantine=False).generation
+        if gen is not None:
+            return gen_chunks_dir(work_dir, rank, gen)
 
     rank_dir = work_dir / f"rank_{rank}"
     wal_data = _read_wal(rank_dir / "wal.json")
@@ -1168,7 +1180,7 @@ def compute_norm(work_dir: str | Path,
         comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     work_dir = Path(work_dir)
-    chunks_dir = _committed_chunks_dir(work_dir, rank)
+    chunks_dir = _committed_chunks_dir(work_dir, rank, comm)
 
     local_norm_sq = 0.0
     for chunk_file in sorted(chunks_dir.glob("chunk_*.bin")):
@@ -1188,7 +1200,7 @@ def collect_state(work_dir: str | Path,
         comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     work_dir = Path(work_dir)
-    chunks_dir = _committed_chunks_dir(work_dir, rank)
+    chunks_dir = _committed_chunks_dir(work_dir, rank, comm)
 
     local_chunks = sorted(chunks_dir.glob("chunk_*.bin"))
     local_state = np.concatenate(
