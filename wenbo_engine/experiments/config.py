@@ -64,6 +64,13 @@ class ExperimentConfig:
     # runner (wenbo_engine.recovery global commit protocol).
     recovery: str | None = None
 
+    # durable checkpoint (R4): promote committed generations to durable storage
+    # and restore them if the local work_dir is lost.  Disabled by default; when
+    # enabled it adds a separate, explicit promotion step between committed
+    # generations (never on the hot gate-execution path).  Keys: enabled,
+    # backend (local_path|s3), root, interval_generations.
+    durable: dict[str, Any] = field(default_factory=dict)
+
     # observability knobs
     checksum: bool = False           # checksum each chunk per stage
     calibrate: bool = True
@@ -97,6 +104,27 @@ class ExperimentConfig:
             raise ValueError(
                 "recovery=generation requires runner=mpi "
                 "(generation recovery is implemented in the MPI runner)")
+        self._validate_durable()
+
+    def _validate_durable(self) -> None:
+        d = self.durable or {}
+        if not d.get("enabled"):
+            return
+        backend = d.get("backend", "local_path")
+        if backend not in ("local_path", "s3"):
+            raise ValueError(
+                f"durable.backend must be local_path|s3, got {backend!r}")
+        if backend == "local_path" and not d.get("root"):
+            raise ValueError("durable.root required when durable.backend=local_path")
+        interval = d.get("interval_generations", 5)
+        if int(interval) < 1:
+            raise ValueError(
+                f"durable.interval_generations must be >= 1, got {interval}")
+        # Durable checkpointing builds on the generation commit protocol.
+        if self.resolved_recovery() != "generation":
+            raise ValueError(
+                "durable.enabled requires recovery=generation "
+                "(durable promotes committed generations)")
 
     def resolved_recovery(self) -> str:
         """Effective recovery mode (derives from use_wal when unset)."""

@@ -558,11 +558,42 @@ def _runner_supports_recovery() -> bool:
     return "recovery" in inspect.signature(run).parameters
 
 
+def _durable_promote(work_dir, comm, durable: dict) -> dict | None:
+    """Promote the final committed generation to durable storage (rank 0 dict).
+
+    Separate, explicit step run after the runner returns — never on the hot
+    path.  Uses the durable package's promotion protocol.
+    """
+    from wenbo_engine.durable import DurableConfig, DurableCheckpointManager
+    from wenbo_engine.recovery.generation_manager import MPICoordinator
+    from wenbo_engine.recovery.recovery_scanner import RecoveryScanner
+
+    run_id = Path(work_dir).name or "comm_workload"
+    dconf = DurableConfig.from_dict(durable)
+    backend = dconf.build_backend()
+    coord = MPICoordinator(comm)
+    cm = DurableCheckpointManager(work_dir, run_id, backend, coord)
+    cm.upload_run_metadata()
+
+    final_gen = RecoveryScanner(work_dir).scan(quarantine=False).generation
+    final_gen = comm.bcast(final_gen, root=0)
+    promoted = []
+    if final_gen is not None:
+        rec = cm.promote(final_gen)
+        if rec is not None:
+            promoted.append(final_gen)
+    if comm.Get_rank() == 0:
+        return {"promoted_generations": promoted, "run_id": run_id,
+                "backend": dconf.backend, "root": dconf.root}
+    return None
+
+
 def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                  work_dir: str | Path, comm=None, seed: int = 42,
                  use_wal: bool = True, verify: bool = False,
                  reorder: bool = False, recovery: str | None = None,
-                 output_dir: str | Path | None = None) -> dict:
+                 output_dir: str | Path | None = None,
+                 durable: dict | None = None) -> dict:
     """Run a communication workload under instrumentation.
 
     Builds the circuit, optionally applies production reordering
@@ -618,6 +649,13 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
     metrics.stage_time = time.perf_counter() - t0
     comm.Barrier()
 
+    # Durable R4 (optional): promote committed generations AFTER the run — a
+    # separate, explicit step, never during gate execution.  Only valid in
+    # generation recovery mode.
+    durable_promotion = None
+    if durable and durable.get("enabled") and recovery == "generation":
+        durable_promotion = _durable_promote(work_dir, comm, durable)
+
     # Global norm (collective — all ranks participate).
     norm = compute_norm(work_dir, comm)
 
@@ -672,6 +710,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
     }
     if correct is not None:
         result["correct"] = correct
+    if durable_promotion is not None:
+        result["durable_promotion"] = durable_promotion
 
     if output_dir is not None:
         write_artifacts(output_dir, result, cd, work_dir=work_dir)
@@ -968,7 +1008,20 @@ def main(argv: list[str] | None = None) -> None:
                          "default so MPI-nonlocal stress is forced)")
     ap.add_argument("--verify", action="store_true",
                     help="collect full state and compare to ref_dense (small n)")
+    ap.add_argument("--durable.enabled", dest="durable_enabled",
+                    action="store_true",
+                    help="promote the committed generation to durable storage "
+                         "(requires --recovery generation)")
+    ap.add_argument("--durable.backend", dest="durable_backend",
+                    choices=["local_path", "s3"], default="local_path")
+    ap.add_argument("--durable.root", dest="durable_root", default=None,
+                    help="durable storage root (filesystem path / mount)")
     args = ap.parse_args(argv)
+
+    durable_cfg = None
+    if args.durable_enabled:
+        durable_cfg = {"enabled": True, "backend": args.durable_backend,
+                       "root": args.durable_root}
 
     # --recovery takes precedence; otherwise derive from --no-wal.
     recovery = args.recovery if args.recovery is not None else (
@@ -992,7 +1045,7 @@ def main(argv: list[str] | None = None) -> None:
         kind=args.kind, n=args.n, depth=args.depth, chunk_bits=chunk_bits,
         work_dir=args.work_dir, comm=comm, seed=args.seed,
         verify=args.verify, reorder=args.reorder, recovery=recovery,
-        output_dir=args.output_dir,
+        output_dir=args.output_dir, durable=durable_cfg,
     )
 
     if rank == 0:

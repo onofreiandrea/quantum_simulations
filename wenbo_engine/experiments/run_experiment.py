@@ -264,6 +264,26 @@ def _crash_env() -> dict:
             if k.startswith("WE_CRASH") or k.startswith("WE_FAULT")}
 
 
+def _as_bool(val) -> bool:
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _apply_durable_overrides(cfg: ExperimentConfig, args) -> None:
+    """Merge --durable.* CLI flags into cfg.durable (CLI wins over YAML)."""
+    d = dict(cfg.durable or {})
+    if args.durable_enabled is not None:
+        d["enabled"] = _as_bool(args.durable_enabled)
+    if args.durable_backend is not None:
+        d["backend"] = args.durable_backend
+    if args.durable_root is not None:
+        d["root"] = args.durable_root
+    if args.durable_interval is not None:
+        d["interval_generations"] = args.durable_interval
+    cfg.durable = d
+
+
 def _run_single_node(cfg, circuit, work_dir, chunk_size, run_dir):
     from wenbo_engine.experiments import instrumented_runner as ir
     io = IOProfiler()
@@ -295,11 +315,25 @@ def _run_mpi(cfg, circuit, work_dir, chunk_size, run_dir, comm, n_ranks, rank):
     from wenbo_engine.mpi import mpi_runner
 
     mode = cfg.resolved_recovery()
+    run_id = run_dir.name
+
+    # Durable R4: if enabled and the local work_dir has no committed generation
+    # (e.g. lost NVMe), restore the newest valid durable generation BEFORE the
+    # run so the generation runner resumes from it.  This touches durable
+    # storage only here, not on the hot path.
+    durable_recovery = _durable_restore_if_needed(
+        cfg, work_dir, run_id, comm, mode)
+
     t0 = time.perf_counter()
     mpi_runner.run(circuit, work_dir, chunk_size=chunk_size,
                    comm=comm, buffer_depth=cfg.buffer_depth,
                    recovery=mode)
     comm.Barrier()
+
+    # Durable R4: promote committed generations to durable storage AFTER the
+    # run (between/at end of steps — never during gate execution).
+    durable_promotion = _durable_promote_after_run(
+        cfg, work_dir, run_id, comm, mode)
     wall = comm.allreduce(time.perf_counter() - t0, op=__import__("mpi4py").MPI.MAX)
     norm = mpi_runner.compute_norm(work_dir, comm=comm)
 
@@ -316,6 +350,12 @@ def _run_mpi(cfg, circuit, work_dir, chunk_size, run_dir, comm, n_ranks, rank):
             "commits_dir": str(Path(work_dir) / "commits"),
             "wal_json_present": (Path(work_dir) / f"rank_{rank}" / "wal.json").exists(),
             "events": [e.to_dict() for e in sc.events],
+        }
+    if rank == 0 and (durable_recovery or durable_promotion):
+        recovery_extra.setdefault("events", [])
+        recovery_extra["durable"] = {
+            "restore": durable_recovery,
+            "promotion": durable_promotion,
         }
 
     if rank == 0:
@@ -338,6 +378,95 @@ def _run_mpi(cfg, circuit, work_dir, chunk_size, run_dir, comm, n_ranks, rank):
     return norm, wall, recovery_extra
 
 
+# ── durable checkpoint (R4) wiring ──────────────────────────────────────────
+
+def _durable_enabled(cfg) -> bool:
+    return bool((cfg.durable or {}).get("enabled"))
+
+
+def _build_durable(cfg, work_dir, run_id, comm):
+    """Build (DurableConfig, backend, coordinator) for the MPI run."""
+    from wenbo_engine.durable import DurableConfig
+    from wenbo_engine.recovery.generation_manager import MPICoordinator
+    dconf = DurableConfig.from_dict(cfg.durable)
+    backend = dconf.build_backend()
+    coord = MPICoordinator(comm)
+    return dconf, backend, coord
+
+
+def _durable_restore_if_needed(cfg, work_dir, run_id, comm, mode) -> dict | None:
+    """Restore the newest durable generation if no local committed gen exists.
+
+    Returns a small status dict (rank 0) or None when durable is off / nothing
+    needed.  Only runs in generation recovery mode.
+    """
+    if mode != "generation" or not _durable_enabled(cfg):
+        return None
+    from wenbo_engine.recovery.recovery_scanner import RecoveryScanner
+    from wenbo_engine.durable import DurableRestoreManager
+
+    # Does the local work_dir already hold a committed generation?
+    local_gen = RecoveryScanner(work_dir).scan(quarantine=False).generation
+    needed = comm.bcast(local_gen is None, root=0)
+    if not needed:
+        return ({"restored": False, "reason": "local committed gen present"}
+                if comm.Get_rank() == 0 else None)
+
+    dconf, backend, coord = _build_durable(cfg, work_dir, run_id, comm)
+    rm = DurableRestoreManager(work_dir, run_id, backend, coord)
+    result = rm.restore_latest(check_checksums=True)
+    if comm.Get_rank() == 0:
+        return {"restored": result.restored, "generation": result.generation}
+    return None
+
+
+def _durable_promote_after_run(cfg, work_dir, run_id, comm, mode) -> dict | None:
+    """Promote committed generations to durable storage after the run.
+
+    Promotes generation 0 and every generation that is a multiple of the
+    configured interval AND still present locally (pruning keeps the newest
+    few), plus the final committed generation.  Returns a status dict on rank
+    0.  Never touches durable storage during gate execution — this is called
+    once the runner has returned.
+    """
+    if mode != "generation" or not _durable_enabled(cfg):
+        return None
+    from wenbo_engine.recovery.recovery_scanner import RecoveryScanner
+    from wenbo_engine.durable import DurableConfig, DurableCheckpointManager
+
+    dconf, backend, coord = _build_durable(cfg, work_dir, run_id, comm)
+    cm = DurableCheckpointManager(work_dir, run_id, backend, coord)
+    cm.upload_run_metadata()
+
+    final_gen = RecoveryScanner(work_dir).scan(quarantine=False).generation
+    final_gen = comm.bcast(final_gen, root=0)
+    promoted: list[int] = []
+    if final_gen is not None:
+        interval = max(1, int(dconf.interval_generations))
+        # Candidate generations: interval multiples (and 0) up to final, plus
+        # the final one.  Only those whose local dir still exists promote.
+        from wenbo_engine.recovery.generation_manager import gen_dir
+        candidates = sorted({0, *range(0, final_gen + 1, interval), final_gen})
+        for g in candidates:
+            # rank 0's local existence is authoritative for the collective
+            # (all ranks prune identically, so this never diverges).
+            if not comm.bcast(gen_dir(work_dir, 0, g).exists(), root=0):
+                continue
+            try:
+                rec = cm.promote(g)
+            except Exception as e:  # pragma: no cover - defensive
+                if comm.Get_rank() == 0:
+                    print(f"durable promotion of gen {g} skipped: {e}")
+                continue
+            if rec is not None:
+                promoted.append(g)
+    if comm.Get_rank() == 0:
+        return {"promoted_generations": promoted,
+                "interval_generations": dconf.interval_generations,
+                "backend": dconf.backend, "root": dconf.root}
+    return None
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 def main(argv=None) -> int:
@@ -351,6 +480,19 @@ def main(argv=None) -> int:
                     default=None,
                     help="crash-recovery mode (overrides config; "
                          "generation requires runner=mpi)")
+    # Durable checkpoint (R4) overrides.  These are dotted to mirror the YAML
+    # ``durable:`` block; they only take effect with --recovery generation.
+    ap.add_argument("--durable.enabled", dest="durable_enabled",
+                    default=None,
+                    help="enable durable checkpointing (true/false)")
+    ap.add_argument("--durable.backend", dest="durable_backend",
+                    choices=["local_path", "s3"], default=None,
+                    help="durable backend (default local_path)")
+    ap.add_argument("--durable.root", dest="durable_root", default=None,
+                    help="durable storage root (filesystem path / mount)")
+    ap.add_argument("--durable.interval-generations",
+                    dest="durable_interval", type=int, default=None,
+                    help="promote every N committed generations (default 5)")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -360,7 +502,8 @@ def main(argv=None) -> int:
         cfg.calibrate = False
     if args.recovery is not None:
         cfg.recovery = args.recovery
-        cfg.validate()
+    _apply_durable_overrides(cfg, args)
+    cfg.validate()
 
     run_dir = run_experiment(cfg, run_id=args.run_id)
 
