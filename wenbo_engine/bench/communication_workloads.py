@@ -562,7 +562,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                  work_dir: str | Path, comm=None, seed: int = 42,
                  use_wal: bool = True, verify: bool = False,
                  reorder: bool = False, recovery: str | None = None,
-                 output_dir: str | Path | None = None) -> dict:
+                 output_dir: str | Path | None = None,
+                 planner: str | None = None) -> dict:
     """Run a communication workload under instrumentation.
 
     Builds the circuit, optionally applies production reordering
@@ -597,6 +598,33 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
     if reorder:
         from wenbo_engine.circuit.reorder import reorder_qubits
         cd, _perm = reorder_qubits(cd)
+
+    # Optimizer v2: when a --planner mode is selected, apply the STATIC
+    # circuit transform the mode implies before running (the MPI runner
+    # levelizes internally, so a static qubit relabelling is what changes
+    # its execution).  The deterministic ablation report is written to the
+    # artifact bundle regardless.  ``current`` / None are behavior-preserving.
+    planner_perm = None
+    if planner is not None and planner != "current":
+        from wenbo_engine.planner import ABLATION_MODES
+        from wenbo_engine.planner.placement_planner import (
+            plan_placement, apply_placement,
+        )
+        from wenbo_engine.planner.qubit_activity import qubit_activity
+        if planner not in ABLATION_MODES:
+            raise ValueError(f"unknown --planner mode {planner!r} "
+                             f"(choices: {ABLATION_MODES})")
+        if planner == "current_static_reorder":
+            from wenbo_engine.circuit.reorder import reorder_qubits
+            cd, planner_perm = reorder_qubits(cd)
+        elif planner == "stage_v2_placement_fusion":
+            p = _rank_bits(num_ranks) if num_ranks >= 1 else 0
+            planner_perm = plan_placement(cd, k=chunk_bits, p=p,
+                                          activity=qubit_activity(cd))
+            cd = apply_placement(cd, planner_perm)
+        # stage_v2 / stage_v2_fusion only change the single-node staging
+        # schedule, not the MPI runner's levelized execution — no static
+        # relabelling, run as-is (the report still captures the gains).
 
     metrics = Metrics()
     pcomm = ProfilingComm(comm, metrics)
@@ -639,6 +667,19 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
     runner_cls = runner_classification(cd, chunk_bits, num_ranks)
     static = classify_circuit(cd, chunk_bits, num_ranks)
 
+    # Deterministic Optimizer-v2 ablation report over the ORIGINAL circuit
+    # (before any planner/reorder transform), so all modes compare fairly.
+    ablation = None
+    try:
+        from wenbo_engine.planner import HardwareConfig, ablation_report
+        orig_cd = build_circuit(kind, n, depth, chunk_bits, num_ranks, seed)
+        hw = HardwareConfig(n_qubits=n, chunk_bits=chunk_bits,
+                            num_ranks=num_ranks,
+                            recovery=recovery if recovery != "none" else "none")
+        ablation = ablation_report(orig_cd, hw, verify_norm=False)
+    except Exception as e:  # pragma: no cover - defensive
+        ablation = {"error": repr(e)}
+
     result = {
         "workload_kind": kind,
         "kind": kind,  # back-compat alias
@@ -650,6 +691,7 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         "use_wal": use_wal,
         "recovery_mode": recovery,
         "reorder_applied": reorder,
+        "planner_mode": planner or "current",
         "intended_locality": INTENDED_LOCALITY.get(kind, "unknown"),
         "n_local_bits": runner_cls["n_local_bits"],
         "n_steps": runner_cls["n_steps"],
@@ -669,6 +711,7 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         "final_norm": norm,
         "aggregate": aggregate,
         "per_rank": all_metrics,
+        "ablation_report": ablation,
     }
     if correct is not None:
         result["correct"] = correct
@@ -802,6 +845,7 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         "use_wal": result["use_wal"],
         "recovery_mode": recovery,
         "reorder_applied": result["reorder_applied"],
+        "planner_mode": result.get("planner_mode", "current"),
         "intended_locality": result["intended_locality"],
         "runner": "mpi",
     }, indent=2))
@@ -832,6 +876,12 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
     # cost_model.json — calibration is the observability harness's job; we
     # only guarantee the artifact exists (honest "not calibrated here").
     (d / "cost_model.json").write_text(json.dumps({"calibrated": False}, indent=2))
+
+    # ablation_report.json — deterministic Optimizer-v2 plan metrics for all
+    # modes on this circuit + hardware config (predicted, not measured).
+    if result.get("ablation_report") is not None:
+        (d / "ablation_report.json").write_text(
+            json.dumps(result["ablation_report"], indent=2, default=str))
 
     # stage_profile.csv — one aggregate row of MEASURED values.  Per-step
     # granularity would need a runner hook (see module notes); op counts are
@@ -966,6 +1016,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--reorder", action="store_true",
                     help="apply production qubit reordering (DISABLED by "
                          "default so MPI-nonlocal stress is forced)")
+    ap.add_argument("--planner", default=None,
+                    help="Optimizer-v2 ablation mode: current | "
+                         "current_static_reorder | stage_v2 | "
+                         "stage_v2_fusion | stage_v2_placement_fusion. "
+                         "Writes ablation_report.json and (for reorder/"
+                         "placement modes) applies the static transform.")
     ap.add_argument("--verify", action="store_true",
                     help="collect full state and compare to ref_dense (small n)")
     args = ap.parse_args(argv)
@@ -986,13 +1042,14 @@ def main(argv: list[str] | None = None) -> None:
         log.info("  recovery: %s", recovery)
         log.info("  reorder: %s", "ON" if args.reorder
                  else "DISABLED (forcing MPI-nonlocal stress)")
+        log.info("  planner: %s", args.planner or "current")
         log.info("=" * 60)
 
     result = run_workload(
         kind=args.kind, n=args.n, depth=args.depth, chunk_bits=chunk_bits,
         work_dir=args.work_dir, comm=comm, seed=args.seed,
         verify=args.verify, reorder=args.reorder, recovery=recovery,
-        output_dir=args.output_dir,
+        output_dir=args.output_dir, planner=args.planner,
     )
 
     if rank == 0:
