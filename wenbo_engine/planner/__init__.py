@@ -1,36 +1,29 @@
-"""Optimizer v2 — a measurable data-movement / communication planner.
+"""Planning layer for the out-of-core simulator.
 
-This package builds an execution *plan* for a circuit under a chosen
-*ablation mode* and computes deterministic, in-process *plan metrics*
-(predicted bytes read / written, MPI bytes, Sendrecv count, number of
-stages, number of commits, full-state passes, estimated runtime) from a
-stage cost model.  The metrics are derived purely from the plan's
-quantities and a hardware ``cost_model`` — no cluster run is required —
-so an ablation between modes can be compared and asserted offline.
+This package hosts two independent, complementary planners:
 
-The five selectable ablation modes are:
+* **Optimizer v2** — builds an execution *plan* for a circuit under a chosen
+  *ablation mode* and computes deterministic, in-process *plan metrics*
+  (predicted bytes read / written, MPI bytes, Sendrecv count, stages,
+  commits, full-state passes, estimated runtime) from a stage cost model, so
+  ablation modes can be compared offline without a cluster run.  Modes:
+  ``current``, ``current_static_reorder``, ``stage_v2``, ``stage_v2_fusion``,
+  ``stage_v2_placement_fusion``.  Every plan is semantically equivalent to the
+  original circuit (verified against ``ref_dense.simulate``).
 
-  ``current``                     today's behavior (levelize + classify,
-                                  no static reorder).
-  ``current_static_reorder``      + :func:`reorder_qubits`.
-  ``stage_v2``                    new staging (Atlas-style local sets).
-  ``stage_v2_fusion``             new staging + 1Q fusion / level batching.
-  ``stage_v2_placement_fusion``   new staging + activity-based placement
-                                  + fusion.
+* **Capacity planner** — a pure, side-effect-free advisory layer that answers
+  "what is the largest *exact* state-vector simulation feasible on this
+  hardware, under this precision, rank count, local storage, RAM, and recovery
+  policy?"  It does arithmetic over the same storage/memory model the runners
+  use (double buffer, retained generations, optional durable checkpoint), so a
+  run can be sized before any byte is written.  45q is just one scenario it can
+  score — nothing is hardcoded to it.
 
-Public surface:
-
-  * :func:`build_plan` — build a :class:`~.optimizer_v2.Plan` for one mode.
-  * :func:`plan_metrics` — compute the metric dict for a plan.
-  * :func:`ablation_report` — compare ALL modes for one circuit + hw config.
-  * :data:`ABLATION_MODES` — the ordered list of mode names.
-  * :func:`serialize_plan` / :func:`deserialize_plan` — deterministic JSON.
-
-Correctness over cleverness: every plan is semantically equivalent to the
-original circuit (verified in the test-suite against ``ref_dense.simulate``).
+The two share no symbols; both APIs are re-exported here.
 """
 from __future__ import annotations
 
+# ── Optimizer v2 ────────────────────────────────────────────────────────
 from wenbo_engine.planner.optimizer_v2 import (
     ABLATION_MODES,
     Plan,
@@ -52,7 +45,23 @@ from wenbo_engine.planner.plan_serializer import (
     plan_to_json,
 )
 
+# ── Capacity planner ────────────────────────────────────────────────────
+from wenbo_engine.planner.capacity_planner import (
+    BYTES_PER_AMP,
+    RECOVERY_MODES,
+    RECOVERY_DEFAULTS,
+    PlannerConfig,
+    QubitFeasibility,
+    state_size_bytes,
+    per_rank_state_bytes,
+    evaluate_qubits,
+    max_feasible_qubits,
+    recommend_recovery_mode,
+    plan,
+)
+
 __all__ = [
+    # optimizer v2
     "ABLATION_MODES",
     "Plan",
     "Stage",
@@ -67,4 +76,16 @@ __all__ = [
     "serialize_plan",
     "deserialize_plan",
     "plan_to_json",
+    # capacity planner
+    "BYTES_PER_AMP",
+    "RECOVERY_MODES",
+    "RECOVERY_DEFAULTS",
+    "PlannerConfig",
+    "QubitFeasibility",
+    "state_size_bytes",
+    "per_rank_state_bytes",
+    "evaluate_qubits",
+    "max_feasible_qubits",
+    "recommend_recovery_mode",
+    "plan",
 ]
