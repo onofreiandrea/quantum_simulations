@@ -768,10 +768,34 @@ def _recovery_events(work_dir: str | Path | None, recovery: str) -> dict:
         out["commit_files"] = [p.name for p in commit_files]
         res = RecoveryScanner(wd).scan(quarantine=False)
         out["committed_generation"] = res.generation
-        if res.events is not None:
-            out["events"] = [e.to_dict() for e in res.events]
+        events = [e.to_dict() for e in res.events] if res.events else []
+        # Merge any durably-recorded injected-fault events (proof #4): a hard
+        # os_exit crash persists these to fault_events.jsonl before dying.
+        faults = _read_fault_events(wd)
+        if faults:
+            out["crashed"] = True
+            out["injected_faults"] = faults
+            events = faults + events
+        out["events"] = events
     except Exception as e:  # pragma: no cover - defensive
         out["scan_error"] = repr(e)
+    return out
+
+
+def _read_fault_events(work_dir: Path) -> list[dict]:
+    """Read durably-persisted injected-fault events (one JSON object per line)."""
+    sink = work_dir / "fault_events.jsonl"
+    if not sink.exists():
+        return []
+    out: list[dict] = []
+    for line in sink.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
     return out
 
 
@@ -966,6 +990,16 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--reorder", action="store_true",
                     help="apply production qubit reordering (DISABLED by "
                          "default so MPI-nonlocal stress is forced)")
+    ap.add_argument("--fault-point", type=str, default=None,
+                    help="inject a deterministic crash at this commit-protocol "
+                         "fault point (e.g. AFTER_GLOBAL_COMMIT); requires "
+                         "--recovery generation")
+    ap.add_argument("--fault-rank", type=str, default=None,
+                    help="rank to crash (default: any)")
+    ap.add_argument("--fault-stage", type=str, default=None,
+                    help="stage_id (circuit step) to crash at (default: any)")
+    ap.add_argument("--fault-mode", type=str, default="os_exit",
+                    help="crash mode: os_exit (default) | exception")
     ap.add_argument("--verify", action="store_true",
                     help="collect full state and compare to ref_dense (small n)")
     args = ap.parse_args(argv)
@@ -973,6 +1007,21 @@ def main(argv: list[str] | None = None) -> None:
     # --recovery takes precedence; otherwise derive from --no-wal.
     recovery = args.recovery if args.recovery is not None else (
         "none" if args.no_wal else "wal")
+
+    # Thread fault-injection config through the environment so every rank's
+    # mpi_runner.run picks it up via FaultInjector.from_env().
+    if args.fault_point:
+        import os as _os
+        _os.environ["WE_FAULT_POINT"] = args.fault_point
+        _os.environ["WE_FAULT_MODE"] = args.fault_mode
+        if args.fault_rank is not None:
+            _os.environ["WE_FAULT_RANK"] = args.fault_rank
+        if args.fault_stage is not None:
+            _os.environ["WE_FAULT_STAGE"] = args.fault_stage
+        if rank == 0:
+            log.info("  fault injection: point=%s rank=%s stage=%s mode=%s",
+                     args.fault_point, args.fault_rank, args.fault_stage,
+                     args.fault_mode)
 
     chunk_bits = args.chunk_bits
     if chunk_bits is None:

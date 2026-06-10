@@ -89,6 +89,39 @@ def _crash_after_step() -> int | None:
     return int(val) if val is not None else None
 
 
+def _attach_fault_event_sink(events, work_dir, rank: int) -> None:
+    """Eagerly persist FAULT_INJECTED events so they survive a hard crash.
+
+    A hard ``os_exit`` crash skips any end-of-run artifact writing, so the
+    injected-fault record would be lost.  We wrap the event log's ``emit`` to
+    append each FAULT_INJECTED event to ``fault_events.jsonl`` immediately
+    (fsync'd) — this is the durable proof that the configured fault fired
+    (proof #4).  Non-fault events are unaffected.
+    """
+    from pathlib import Path as _Path
+    from wenbo_engine.recovery.recovery_events import EventType
+    import json as _json
+
+    sink = _Path(work_dir) / "fault_events.jsonl"
+    sink.parent.mkdir(parents=True, exist_ok=True)
+    _orig_emit = events.emit
+
+    def _emit(type, message="", *, generation=None, rank=None, **details):
+        ev = _orig_emit(type, message, generation=generation, rank=rank,
+                        **details)
+        if type == EventType.FAULT_INJECTED:
+            try:
+                with open(sink, "a") as f:
+                    f.write(_json.dumps(ev.to_dict()) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            except OSError:
+                pass
+        return ev
+
+    events.emit = _emit
+
+
 # ── pipelined I/O + compute ───────────────────────────────────────────
 
 _SENTINEL = None
@@ -781,6 +814,7 @@ def run(
     comm: MPI.Comm | None = None,
     buffer_depth: int = 4,
     recovery: str | None = None,
+    fault_injector=None,
 ) -> Path:
     """Run a quantum circuit distributed across MPI ranks.
 
@@ -809,7 +843,7 @@ def run(
                          "(expected none|wal|generation)")
     if recovery == "generation":
         return _run_generation(circuit_dict, work_dir, chunk_size, comm,
-                               buffer_depth)
+                               buffer_depth, fault_injector=fault_injector)
     # none / wal share the double-buffer path; WAL writes are gated below.
     use_wal = (recovery == "wal")
 
@@ -954,7 +988,7 @@ def run(
 
 def _run_generation(circuit_dict: dict, work_dir: str | Path,
                     chunk_size: int, comm: "MPI.Comm",
-                    buffer_depth: int) -> Path:
+                    buffer_depth: int, fault_injector=None) -> Path:
     """Distributed run with generation-based recovery (--recovery=generation).
 
     Reuses the same compiled steps and :func:`_apply_step` kernel pipeline as
@@ -968,6 +1002,14 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
     from wenbo_engine.recovery.generation_manager import (
         GenerationManager, MPICoordinator, gen_dir, gen_chunks_dir,
     )
+    from wenbo_engine.faults.fault_injector import FaultInjector
+    from wenbo_engine.faults.fault_points import FaultPoint
+
+    # Build the fault injector: explicit arg wins, else read WE_FAULT_* env so
+    # a crash can be configured for a subprocess / mpirun run.  Defaults to a
+    # disabled (no-op) injector when nothing is configured.
+    if fault_injector is None:
+        fault_injector = FaultInjector.from_env()
 
     rank = comm.Get_rank()
     n_ranks = comm.Get_size()
@@ -991,11 +1033,22 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
     crash_after = _crash_after_step()
 
     coord = MPICoordinator(comm)
+    # Attach an event log to the injector so a fired fault is recorded as a
+    # structured recovery event (proof #4: recovery_events.json records the
+    # fault).  The manager shares the same log.
+    from wenbo_engine.recovery.recovery_events import RecoveryEventLog
+    events = RecoveryEventLog()
+    fault_injector.events = events
     gm = GenerationManager(
         work, coord, circuit_hash=circ_hash,
         dtype=str(np.dtype(DTYPE)), chunk_size=chunk_size,
+        events=events, fault_injector=fault_injector,
     )
     gm.init_run(n_qubits=n, recovery_mode="generation")
+    # Persist any fired-fault event to recovery_events.json (best effort) so
+    # the record survives a hard os_exit crash.  Re-emitted via a small JSONL
+    # sink written eagerly on each emit.
+    _attach_fault_event_sink(events, work, rank)
 
     # Resume from newest valid committed generation (None = fresh start).
     resume_gen = gm.resume_generation()
@@ -1034,6 +1087,10 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
         dst_dir = gen_dir(work, rank, next_gen)
         (dst_dir / "chunks").mkdir(parents=True, exist_ok=True)
 
+        # Source generation g is committed and about to be read/transformed.
+        # A crash here leaves NO chunks in g+1 → recovery keeps g.
+        fault_injector.maybe_fire(FaultPoint.AFTER_READ, rank, step_idx)
+
         # Apply the step: src gen -> dst gen (same kernel path as WAL mode).
         _apply_step(
             comm, rank, n_local_bits, src_dir, dst_dir,
@@ -1043,8 +1100,16 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
         )
 
         # Chunks are already on disk in dst; the manifest just records them.
+        # AFTER_PARTIAL_WRITE fires after recording the first chunk but before
+        # the rest, modelling a crash partway through committing the output.
         def _writer(cdir: Path):
-            return [gm.chunk_record(cdir, ci) for ci in range(n_chunks_per_rank)]
+            recs = []
+            for ci in range(n_chunks_per_rank):
+                recs.append(gm.chunk_record(cdir, ci))
+                if ci == 0:
+                    fault_injector.maybe_fire(
+                        FaultPoint.AFTER_PARTIAL_WRITE, rank, step_idx)
+            return recs
 
         rec = gm.commit_step(next_gen, step_idx, _writer,
                              parent_generation=cur_gen)

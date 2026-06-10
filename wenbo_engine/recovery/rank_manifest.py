@@ -169,11 +169,17 @@ class RankManifest:
 
     # ── atomic file I/O ───────────────────────────────────────────────
 
-    def write_atomic(self, gen_dir: str | Path) -> Path:
+    def write_atomic(self, gen_dir: str | Path, *,
+                     after_tmp_fsync=None) -> Path:
         """Write manifest.json into ``gen_dir`` (tmp + fsync + rename).
 
         Implements commit-protocol steps 5–7.  Seals the hash first so the
         persisted file always carries a hash consistent with its content.
+
+        ``after_tmp_fsync`` is an optional hook called *after* manifest.tmp is
+        written and fsynced (step 6) but *before* it is renamed into place
+        (step 7).  It exists solely so the fault injector can crash between
+        those two steps; it is ``None`` (no-op) in normal operation.
         """
         self.validate()
         self.seal()
@@ -186,6 +192,8 @@ class RankManifest:
             f.write(raw)
             f.flush()
             os.fsync(f.fileno())
+        if after_tmp_fsync is not None:
+            after_tmp_fsync()
         os.replace(str(tmp), str(final))
         _fsync_dir(d)          # make the manifest.json rename durable
         return final

@@ -51,6 +51,9 @@ class EventType(str, Enum):
     GENERATION_INSTALLED = "generation_installed"
     COMMIT_ABORTED = "commit_aborted"
 
+    # Fault injection (deterministic crash testing)
+    FAULT_INJECTED = "fault_injected"
+
 
 @dataclass
 class RecoveryEvent:
