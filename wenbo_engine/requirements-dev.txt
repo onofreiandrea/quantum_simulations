@@ -1,0 +1,27 @@
+# Development / test dependencies.
+#
+# Runtime deps are in requirements.txt.  These are needed to run the full test
+# suite and benchmarks; tests that depend on an optional package self-skip when
+# it is absent (e.g. the S3 backend tests skip without boto3 + moto).
+#
+# Install:  pip install -r wenbo_engine/requirements.txt -r wenbo_engine/requirements-dev.txt
+
+pytest>=8.0
+
+# distributed execution + measurement
+mpi4py>=3.1
+psutil>=5.9
+
+# numerical kernel JIT (hot-path speedups); numpy fallback used when absent
+numba>=0.58
+
+# circuit staging ILP (optional staging method)
+pulp>=2.7
+
+# experiment config
+pyyaml>=6.0
+
+# durable S3 backend + its tests (moto mocks S3 in-process; no AWS needed).
+# NOTE: no AWS credentials or bucket names live in the repo — see tests/test_durable_s3.py
+boto3>=1.28
+moto>=5.0
