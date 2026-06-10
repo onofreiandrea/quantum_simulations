@@ -595,7 +595,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                  output_dir: str | Path | None = None,
                  durable: dict | None = None,
                  planner: str | None = None,
-                 mpi_exchange_mode: str = "naive") -> dict:
+                 mpi_exchange_mode: str = "naive",
+                 storage_layout: str = "chunks") -> dict:
     """Run a communication workload under instrumentation.
 
     Builds the circuit, optionally applies production reordering
@@ -666,7 +667,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
     with _instrument_runner(metrics):
         if _runner_supports_recovery():
             run(cd, work_dir, chunk_size=chunk_size, comm=pcomm,
-                recovery=recovery, mpi_exchange_mode=mpi_exchange_mode)
+                recovery=recovery, mpi_exchange_mode=mpi_exchange_mode,
+                storage_layout=storage_layout)
         elif recovery == "generation":
             raise RuntimeError(
                 "recovery='generation' requires the generation-recovery "
@@ -733,6 +735,7 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         "reorder_applied": reorder,
         "planner_mode": planner or "current",
         "mpi_exchange_mode": mpi_exchange_mode,
+        "storage_layout": storage_layout,
         "intended_locality": INTENDED_LOCALITY.get(kind, "unknown"),
         "n_local_bits": runner_cls["n_local_bits"],
         "n_steps": runner_cls["n_steps"],
@@ -914,6 +917,7 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         "reorder_applied": result["reorder_applied"],
         "planner_mode": result.get("planner_mode", "current"),
         "mpi_exchange_mode": result.get("mpi_exchange_mode", "naive"),
+        "storage_layout": result.get("storage_layout", "chunks"),
         "intended_locality": result["intended_locality"],
         "runner": "mpi",
     }, indent=2))
@@ -1030,6 +1034,8 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         "estimated_partner_rank_pairs": result["estimated_partner_rank_pairs"],
         "final_norm": result["final_norm"],
         "reorder_applied": result["reorder_applied"],
+        "mpi_exchange_mode": result.get("mpi_exchange_mode", "naive"),
+        "storage_layout": result.get("storage_layout", "chunks"),
         "metrics_are_measured": True,
     }
     if "correct" in result:
@@ -1105,6 +1111,11 @@ def main(argv: list[str] | None = None) -> None:
                     help="MPI-nonlocal exchange path: naive (one Sendrecv per "
                          "chunk per gate) or gate_aware (batch per-partner + "
                          "reuse received remote chunks).")
+    ap.add_argument("--storage-layout", dest="storage_layout",
+                    choices=["chunks", "extents"], default="chunks",
+                    help="On-disk layout for committed generations: chunks (one "
+                         "file per chunk) or extents (pack many chunks into few "
+                         "extent files). Generation recovery only.")
     ap.add_argument("--verify", action="store_true",
                     help="collect full state and compare to ref_dense (small n)")
     ap.add_argument("--durable.enabled", dest="durable_enabled",
@@ -1162,6 +1173,7 @@ def main(argv: list[str] | None = None) -> None:
         verify=args.verify, reorder=args.reorder, recovery=recovery,
         output_dir=args.output_dir, durable=durable_cfg, planner=args.planner,
         mpi_exchange_mode=args.mpi_exchange_mode,
+        storage_layout=args.storage_layout,
     )
 
     if rank == 0:

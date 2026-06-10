@@ -165,6 +165,15 @@ class DurableRestoreManager:
         self.backend.get_to_file(entry.manifest.key,
                                  tmp_gdir / RankManifest.MANIFEST_NAME)
 
+        # Extent-backed generation: re-pack the downloaded chunk files into the
+        # exact extent layout the manifest records, so the restored generation
+        # is extent-backed and validates against its manifest.
+        if any(c.is_extent for c in man.chunks):
+            from wenbo_engine.storage.extent_store import (
+                reconstruct_extents_from_chunks,
+            )
+            reconstruct_extents_from_chunks(tmp_gdir, man.chunks)
+
         # Atomic publish: replace any partial final dir with the temp dir.
         if final_gdir.exists():
             shutil.rmtree(final_gdir, ignore_errors=True)

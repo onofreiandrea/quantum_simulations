@@ -140,6 +140,26 @@ def validate_rank_manifest(
                 generation=generation, rank=rank)
         return res
 
+    # Extent-backed generation: validate each chunk's extent slice instead of
+    # a standalone chunk file (existence + size/offset coverage + checksum).
+    if any(c.is_extent for c in man.chunks):
+        from wenbo_engine.storage.extent_store import validate_extent_chunk
+        from wenbo_engine.storage.extent_manifest import ExtentChunkRecord
+        gdir = gen_dir(work_dir, rank, generation)
+        for c in man.chunks:
+            erec = ExtentChunkRecord(
+                chunk_id=c.index, extent_id=c.extent_id,
+                offset=c.extent_offset, length=c.size_bytes,
+                checksum=c.checksum or "")
+            reason = validate_extent_chunk(
+                gdir, erec,
+                check_checksum=check_checksums and c.checksum is not None)
+            if reason:
+                res.fail(f"rank {rank} gen {generation}: {reason}")
+                ev.emit(EventType.CHUNK_MISSING, res.reason,
+                        generation=generation, rank=rank)
+        return res
+
     # Chunk files: existence + size (+ optional checksum).
     cdir = gen_chunks_dir(work_dir, rank, generation)
     for c in man.chunks:

@@ -188,6 +188,7 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
         cfg_out = cfg.to_dict()
         cfg_out["run_id"] = run_id
         cfg_out["planner_mode"] = getattr(cfg, "planner", None) or "current"
+        cfg_out["storage_layout"] = getattr(cfg, "storage_layout", "chunks")
         (run_dir / "config.json").write_text(json.dumps(cfg_out, indent=2))
         (run_dir / "circuit.json").write_text(json.dumps(circuit, indent=2, default=str))
         if cfg.circuit.source == "qasm" and cfg.circuit.path:
@@ -271,6 +272,7 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
             "chunk_size": chunk_size,
             "n_ranks": n_ranks,
             "recovery_mode": cfg.resolved_recovery(),
+            "storage_layout": getattr(cfg, "storage_layout", "chunks"),
             "wall_sec": round(wall, 6),
             "final_norm": norm,
         })
@@ -347,7 +349,8 @@ def _run_mpi(cfg, circuit, work_dir, chunk_size, run_dir, comm, n_ranks, rank):
     t0 = time.perf_counter()
     mpi_runner.run(circuit, work_dir, chunk_size=chunk_size,
                    comm=comm, buffer_depth=cfg.buffer_depth,
-                   recovery=mode)
+                   recovery=mode,
+                   storage_layout=getattr(cfg, "storage_layout", "chunks"))
     comm.Barrier()
 
     # Durable R4: promote committed generations to durable storage AFTER the
@@ -518,6 +521,11 @@ def main(argv=None) -> int:
                          "and used to select the ablation_report's mode "
                          "(current | current_static_reorder | stage_v2 | "
                          "stage_v2_fusion | stage_v2_placement_fusion)")
+    ap.add_argument("--storage-layout", dest="storage_layout",
+                    choices=["chunks", "extents"], default="chunks",
+                    help="On-disk layout for committed generations: chunks "
+                         "(one file per chunk, default) or extents (pack many "
+                         "chunks into few extent files). Generation recovery.")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -530,6 +538,7 @@ def main(argv=None) -> int:
     _apply_durable_overrides(cfg, args)
     if args.planner is not None:
         cfg.planner = args.planner
+    cfg.storage_layout = args.storage_layout
     cfg.validate()
 
     run_dir = run_experiment(cfg, run_id=args.run_id)
