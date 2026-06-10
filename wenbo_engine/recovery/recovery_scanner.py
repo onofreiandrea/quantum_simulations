@@ -26,7 +26,9 @@ from pathlib import Path
 from wenbo_engine.recovery.global_commit import (
     GlobalCommitRecord, list_commit_files,
 )
-from wenbo_engine.recovery.generation_validator import validate_generation
+from wenbo_engine.recovery.generation_validator import (
+    validate_generation, validate_commit_record, validate_rank_manifest,
+)
 from wenbo_engine.recovery.recovery_events import EventType, RecoveryEventLog
 from wenbo_engine.recovery.generation_manager import (
     commits_dir, gen_dir, quarantine_dir,
@@ -192,3 +194,175 @@ class RecoveryScanner:
             dest = qdir / f"{name}.{suffix}"
             suffix += 1
         return dest
+
+
+# ── distributed (node-local, multi-node) recovery scan ──────────────────
+
+class DistributedRecoveryScanner:
+    """Recovery scan that works with a *node-local* work_dir per rank.
+
+    The single-host :class:`RecoveryScanner` assumes one rank (rank 0) can read
+    every rank's manifest + chunks from a shared work_dir.  That holds for
+    ``mpirun -np N`` on one host (shared FS) but FAILS on true multi-node where
+    each rank only sees its own ``rank_<r>/`` subtree on node-local NVMe.
+
+    This scanner fixes that.  The protocol (rank 0 == coordinator):
+
+      1. Only the coordinator lists + reads the global commit records
+         (``commits/`` is coordinator-visible) and validates each at the
+         commit level (self-hash, n_ranks, circuit hash).  It broadcasts the
+         ordered candidate records (newest → oldest) to all ranks.
+      2. For each candidate, **every rank validates ONLY its own partition**
+         (``validate_rank_manifest`` reads just ``rank_<r>/generations/...``):
+         manifest present, self-hash ok, manifest hash == the hash recorded in
+         the global commit for this rank, lineage (parent_generation, stage_id)
+         == the commit's, chunk sizes (+ checksums if enabled).
+      3. Per-rank pass/fail is ``gather``-ed to the coordinator and the AND is
+         ``broadcast`` back, so a generation is accepted only if **all** ranks
+         validated their own slice — otherwise all ranks reject in lockstep and
+         try the previous commit.
+
+    Guarantees the required invariants:
+      * no valid global commit record ⇒ no committed generation (rank 0 still
+        owns the commit records);
+      * every rank recovers the SAME generation id (the decision is a single
+        broadcast value);
+      * no mixed-generation state — a rank whose local manifest is a different
+        generation/lineage fails the hash/lineage check, so the whole
+        generation is rejected;
+      * no shared work_dir assumption — each rank only ever reads its own
+        rank dir.
+
+    Degenerates correctly to the single-rank case under ``LocalCoordinator``.
+    """
+
+    def __init__(self, work_dir, coord, events: RecoveryEventLog | None = None):
+        self.work_dir = Path(work_dir)
+        self.coord = coord
+        self.events = events or RecoveryEventLog(emit=False)
+
+    def find_latest_valid_generation(
+        self, *, check_sizes: bool = True, check_checksums: bool = False,
+        quarantine: bool = True,
+    ) -> ScanResult:
+        coord = self.coord
+        ev = self.events
+        rank = coord.rank
+
+        # ── 1. coordinator reads + commit-validates every record, broadcasts ──
+        if coord.is_coordinator:
+            ev.emit(EventType.SCAN_STARTED,
+                    "distributed scan for committed generations")
+            meta = read_run_metadata(self.work_dir)
+            exp_circ = meta.circuit_hash if meta else None
+            cands = []
+            for p in reversed(list_commit_files(commits_dir(self.work_dir))):
+                try:
+                    rec = GlobalCommitRecord.read_file(p)
+                except (ValueError, OSError) as e:
+                    ev.emit(EventType.COMMIT_INVALID,
+                            f"unreadable commit file {p.name}: {e}")
+                    continue
+                cres = validate_commit_record(
+                    rec, expected_circuit_hash=exp_circ,
+                    expected_n_ranks=coord.n_ranks, events=ev)
+                cands.append({"rec": rec, "path": str(p),
+                              "commit_ok": cres.valid})
+            payload = {"exp_circ": exp_circ, "cands": cands}
+        else:
+            payload = None
+        payload = coord.broadcast(payload)
+        exp_circ = payload["exp_circ"]
+        cands = payload["cands"]
+
+        # ── 2-3. per-candidate: each rank validates its own slice; AND-combine ──
+        chosen: ScanResult | None = None
+        inspected = 0
+        for c in cands:
+            inspected += 1
+            if not c["commit_ok"]:
+                # commit-level invalid: all ranks skip in lockstep (no collective)
+                continue
+            rec = c["rec"]
+            expected_hash = rec.rank_manifest_hashes.get(rank, "")
+            local = validate_rank_manifest(
+                self.work_dir, rank, rec.generation, expected_hash,
+                expected_circuit_hash=exp_circ,
+                expected_parent_generation=rec.parent_generation,
+                expected_stage_id=rec.step_index,
+                check_sizes=check_sizes, check_checksums=check_checksums,
+                events=ev,
+            )
+            local_ok = bool(local.valid)
+            gathered = coord.gather(local_ok)
+            all_ok = all(gathered) if coord.is_coordinator else None
+            all_ok = coord.broadcast(all_ok)
+            if all_ok:
+                chosen = ScanResult(
+                    generation=rec.generation, record=rec,
+                    commit_path=Path(c["path"]), inspected=inspected, events=ev)
+                break
+            ev.emit(EventType.ROLLBACK,
+                    f"generation {rec.generation} invalid on >=1 rank, "
+                    f"rolling back", generation=rec.generation)
+
+        # ── result + per-rank quarantine of newer uncommitted gens ──
+        if chosen is None:
+            ev.emit(EventType.FRESH_START,
+                    "no valid committed generation across all ranks")
+            result = ScanResult(generation=None, inspected=inspected, events=ev)
+            keep = -1
+        else:
+            ev.emit(EventType.RECOVERED,
+                    f"recovered generation {chosen.generation} (all ranks)",
+                    generation=chosen.generation)
+            result = chosen
+            keep = chosen.generation
+
+        if quarantine:
+            result.quarantined = self._quarantine_local_newer_than(rank, keep)
+        coord.barrier()
+        return result
+
+    def _quarantine_local_newer_than(self, rank: int, keep_generation: int):
+        """Quarantine THIS rank's gen dirs newer than ``keep_generation``.
+
+        Scoped to the local rank only (each rank owns its node-local dir), so
+        on a shared FS multiple ranks never fight over the same directories.
+        """
+        moved = []
+        gens = gen_dir(self.work_dir, rank, 0).parent  # rank_<r>/generations
+        if not gens.exists():
+            return moved
+        for gdir in sorted(gens.glob("gen_*")):
+            gnum = _gen_num(gdir.name)
+            if gnum is None or gnum <= keep_generation:
+                continue
+            qdir = quarantine_dir(self.work_dir, rank)
+            qdir.mkdir(parents=True, exist_ok=True)
+            dest = qdir / gdir.name
+            suffix = 1
+            while dest.exists():
+                dest = qdir / f"{gdir.name}.{suffix}"
+                suffix += 1
+            shutil.move(str(gdir), str(dest))
+            moved.append(dest)
+            self.events.emit(
+                EventType.QUARANTINED,
+                f"quarantined uncommitted {gdir.name} (rank {rank})",
+                generation=gnum, rank=rank, dest=str(dest))
+        return moved
+
+
+def find_latest_valid_generation_mpi(work_dir, comm, *,
+                                     check_sizes: bool = True,
+                                     check_checksums: bool = False,
+                                     quarantine: bool = True,
+                                     events: RecoveryEventLog | None = None) -> ScanResult:
+    """Convenience wrapper: distributed scan over an mpi4py communicator."""
+    from wenbo_engine.recovery.generation_manager import MPICoordinator
+    scanner = DistributedRecoveryScanner(
+        work_dir, MPICoordinator(comm), events=events)
+    return scanner.find_latest_valid_generation(
+        check_sizes=check_sizes, check_checksums=check_checksums,
+        quarantine=quarantine)

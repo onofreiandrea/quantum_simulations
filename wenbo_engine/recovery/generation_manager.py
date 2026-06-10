@@ -537,11 +537,20 @@ class GenerationManager:
                           check_checksums: bool = False) -> int | None:
         """Return the newest committed+valid generation, or None for fresh.
 
+        Uses the *distributed* scanner so recovery works with a node-local
+        work_dir per rank (true multi-node): each rank validates only its own
+        partition and results are combined through the coordinator.  Degenerates
+        to a single-rank scan under ``LocalCoordinator``.  The standalone
+        :class:`~wenbo_engine.recovery.recovery_scanner.RecoveryScanner`
+        (shared-FS) is left intact for direct/non-MPI callers and tests.
+
         Lazy-imports the scanner to avoid an import cycle.
         """
-        from wenbo_engine.recovery.recovery_scanner import RecoveryScanner
-        scanner = RecoveryScanner(self.work_dir, events=self.events)
-        result = scanner.scan(quarantine=quarantine and self.coord.is_coordinator,
-                              check_checksums=check_checksums)
-        self.coord.barrier()
+        from wenbo_engine.recovery.recovery_scanner import (
+            DistributedRecoveryScanner,
+        )
+        scanner = DistributedRecoveryScanner(
+            self.work_dir, self.coord, events=self.events)
+        result = scanner.find_latest_valid_generation(
+            quarantine=quarantine, check_checksums=check_checksums)
         return result.generation
