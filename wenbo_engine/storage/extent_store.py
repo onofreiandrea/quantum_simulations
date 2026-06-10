@@ -98,6 +98,103 @@ def write_generation_extents(gen_dir, chunks: dict[int, np.ndarray], *,
     return man.seal()
 
 
+def pack_chunk_files(gen_dir, n_chunks: int, *, chunk_size: int,
+                     extent_bytes: int = DEFAULT_EXTENT_BYTES,
+                     delete_chunks: bool = True) -> ExtentManifest:
+    """Pack an existing ``gen_dir/chunks/`` directory into extent files.
+
+    Reads ``chunk_000000.bin .. chunk_{n-1}.bin``, writes them into extents
+    (atomically), and (default) removes the chunk files + the now-empty chunks
+    dir.  Returns the sealed :class:`ExtentManifest`.  Used to convert a
+    freshly-computed generation (written by the unchanged compute path) into the
+    at-rest extent layout before commit.
+    """
+    from wenbo_engine.storage.block_store import read_chunk, chunk_filename
+    gdir = Path(gen_dir)
+    cdir = gdir / "chunks"
+    chunks = {i: read_chunk(cdir / chunk_filename(i)) for i in range(n_chunks)}
+    man = write_generation_extents(gdir, chunks, chunk_size=chunk_size,
+                                   extent_bytes=extent_bytes)
+    if delete_chunks:
+        for i in range(n_chunks):
+            (cdir / chunk_filename(i)).unlink(missing_ok=True)
+        try:
+            cdir.rmdir()
+        except OSError:
+            pass
+    return man
+
+
+def materialize_to_chunk_files(gen_dir, records, *, force: bool = False) -> None:
+    """Unpack extent slices back into ``gen_dir/chunks/chunk_NNNNNN.bin``.
+
+    ``records`` is an iterable of objects with ``index``/``extent_id``/
+    ``extent_offset``/``size_bytes`` (rank-manifest ChunkRecords) OR
+    ExtentChunkRecords.  No-op for an already-materialized chunks dir unless
+    ``force``.  Lets the unchanged compute path read a committed (extent-backed)
+    generation as plain chunk files.
+    """
+    from wenbo_engine.storage.block_store import write_chunk_atomic, chunk_filename
+    gdir = Path(gen_dir)
+    cdir = gdir / "chunks"
+    for r in records:
+        idx = getattr(r, "index", None)
+        if idx is None:
+            idx = r.chunk_id
+        eid = getattr(r, "extent_id")
+        off = getattr(r, "extent_offset", None)
+        if off is None:
+            off = r.offset
+        length = getattr(r, "size_bytes", None)
+        if length is None:
+            length = r.length
+        dst = cdir / chunk_filename(idx)
+        if dst.exists() and not force:
+            continue
+        path = gdir / EXTENTS_DIRNAME / extent_filename(eid)
+        with open(path, "rb") as f:
+            f.seek(off)
+            raw = f.read(length)
+        write_chunk_atomic(dst, np.frombuffer(raw, dtype=DTYPE).copy())
+
+
+def reconstruct_extents_from_chunks(gen_dir, records, *,
+                                    delete_chunks: bool = True) -> None:
+    """Rebuild extent files from chunk files using recorded offsets.
+
+    ``records`` = rank-manifest ChunkRecords (index/extent_id/extent_offset/
+    size_bytes).  Used by durable restore: chunks are downloaded as files, then
+    re-packed into the exact extent layout the manifest describes, so the
+    restored generation is extent-backed and validates against its manifest.
+    """
+    from collections import defaultdict
+    from wenbo_engine.storage.block_store import read_chunk, chunk_filename
+    gdir = Path(gen_dir)
+    cdir = gdir / "chunks"
+    edir = gdir / EXTENTS_DIRNAME
+    edir.mkdir(parents=True, exist_ok=True)
+    by_ext = defaultdict(list)
+    for r in records:
+        by_ext[r.extent_id].append(r)
+    for eid, recs in by_ext.items():
+        recs.sort(key=lambda r: r.extent_offset)
+        tmp = edir / (extent_filename(eid) + ".tmp")
+        with open(tmp, "wb") as f:
+            for r in recs:
+                data = read_chunk(cdir / chunk_filename(r.index))
+                f.write(np.ascontiguousarray(data, dtype=DTYPE).tobytes())
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp), str(edir / extent_filename(eid)))
+    if delete_chunks:
+        for r in records:
+            (cdir / chunk_filename(r.index)).unlink(missing_ok=True)
+        try:
+            cdir.rmdir()
+        except OSError:
+            pass
+
+
 def read_logical_chunk(gen_dir, manifest: ExtentManifest,
                        chunk_id: int) -> np.ndarray:
     """Read one logical chunk by id from its extent (seek + read length)."""

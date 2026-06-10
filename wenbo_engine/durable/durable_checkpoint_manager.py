@@ -154,6 +154,13 @@ class DurableCheckpointManager:
         cdir = gen_chunks_dir(self.work_dir, rank, generation)
         man = RankManifest.read(gdir)
 
+        # Extent-backed generation: unpack to chunk files so the existing
+        # per-chunk upload path works unchanged (durable stores chunk files;
+        # restore re-packs them into the manifest's extent layout).
+        if any(c.is_extent for c in man.chunks):
+            from wenbo_engine.storage.extent_store import materialize_to_chunk_files
+            materialize_to_chunk_files(gdir, man.chunks)
+
         # Upload + verify each chunk file.
         chunk_records: list[DurableFileRecord] = []
         for c in sorted(man.chunks, key=lambda x: x.index):

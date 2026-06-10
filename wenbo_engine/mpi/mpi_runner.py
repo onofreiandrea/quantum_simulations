@@ -838,6 +838,7 @@ def run(
     recovery: str | None = None,
     fault_injector=None,
     mpi_exchange_mode: str = "naive",
+    storage_layout: str = "chunks",
 ) -> Path:
     """Run a quantum circuit distributed across MPI ranks.
 
@@ -867,7 +868,8 @@ def run(
     if recovery == "generation":
         return _run_generation(circuit_dict, work_dir, chunk_size, comm,
                                buffer_depth, fault_injector=fault_injector,
-                               mpi_exchange_mode=mpi_exchange_mode)
+                               mpi_exchange_mode=mpi_exchange_mode,
+                               storage_layout=storage_layout)
     # none / wal share the double-buffer path; WAL writes are gated below.
     use_wal = (recovery == "wal")
 
@@ -1009,12 +1011,48 @@ def run(
     return src_dir  # committed state directory
 
 
+# ── extent-layout helpers (committed gens stored as extents at rest) ────
+
+def _materialize_source_if_extent(gen_directory: Path) -> None:
+    """If a committed generation is extent-backed, unpack it to chunk files.
+
+    Lets the unchanged compute path (_apply_step + MPI exchange) read the source
+    generation as plain ``chunks/`` files; no hot-path code knows about extents.
+    """
+    from wenbo_engine.recovery.rank_manifest import RankManifest
+    from wenbo_engine.storage.extent_store import materialize_to_chunk_files
+    if RankManifest.exists(gen_directory):
+        man = RankManifest.read(gen_directory)
+        if any(c.is_extent for c in man.chunks):
+            materialize_to_chunk_files(gen_directory, man.chunks)
+
+
+def _extent_pack_records(cdir: Path, n_chunks_per_rank: int, chunk_size: int):
+    """Pack a freshly-written ``chunks/`` dir into extents; return ChunkRecords.
+
+    Used as the commit ``write_chunks`` callback in extent mode: the compute
+    path already wrote chunk files, so we pack them into extent files (deleting
+    the chunk files) and return rank-manifest records carrying extent location.
+    """
+    from wenbo_engine.storage.extent_store import pack_chunk_files
+    from wenbo_engine.recovery.rank_manifest import ChunkRecord
+    man = pack_chunk_files(cdir.parent, n_chunks_per_rank, chunk_size=chunk_size)
+    recs = []
+    for ci in range(n_chunks_per_rank):
+        er = man.records[ci]
+        recs.append(ChunkRecord(
+            index=ci, filename=chunk_filename(ci), size_bytes=er.length,
+            checksum=er.checksum, extent_id=er.extent_id, extent_offset=er.offset))
+    return recs
+
+
 # ── generation-based recovery run ──────────────────────────────────────
 
 def _run_generation(circuit_dict: dict, work_dir: str | Path,
                     chunk_size: int, comm: "MPI.Comm",
                     buffer_depth: int, fault_injector=None,
-                    mpi_exchange_mode: str = "naive") -> Path:
+                    mpi_exchange_mode: str = "naive",
+                    storage_layout: str = "chunks") -> Path:
     """Distributed run with generation-based recovery (--recovery=generation).
 
     Reuses the same compiled steps and :func:`_apply_step` kernel pipeline as
@@ -1083,6 +1121,8 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
         # Commit generation 0 = the initial |0...0> state.
         def _init_writer(cdir: Path):
             _init_rank_state(rank, cdir, n_chunks_per_rank, chunk_size)
+            if storage_layout == "extents":
+                return _extent_pack_records(cdir, n_chunks_per_rank, chunk_size)
             return [gm.chunk_record(cdir, ci) for ci in range(n_chunks_per_rank)]
 
         rec = gm.commit_step(0, -1, _init_writer)
@@ -1113,6 +1153,11 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
         dst_dir = gen_dir(work, rank, next_gen)
         (dst_dir / "chunks").mkdir(parents=True, exist_ok=True)
 
+        # Extent mode: unpack the committed source generation's extents into
+        # chunk files so the unchanged compute path can read it.
+        if storage_layout == "extents":
+            _materialize_source_if_extent(src_dir)
+
         # Source generation g is committed and about to be read/transformed.
         # A crash here leaves NO chunks in g+1 → recovery keeps g.
         fault_injector.maybe_fire(FaultPoint.AFTER_READ, rank, step_idx)
@@ -1130,6 +1175,11 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
         # AFTER_PARTIAL_WRITE fires after recording the first chunk but before
         # the rest, modelling a crash partway through committing the output.
         def _writer(cdir: Path):
+            if storage_layout == "extents":
+                recs = _extent_pack_records(cdir, n_chunks_per_rank, chunk_size)
+                fault_injector.maybe_fire(
+                    FaultPoint.AFTER_PARTIAL_WRITE, rank, step_idx)
+                return recs
             recs = []
             for ci in range(n_chunks_per_rank):
                 recs.append(gm.chunk_record(cdir, ci))
@@ -1145,6 +1195,11 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
                 f"generation commit aborted at step {step_idx} "
                 f"(gen {next_gen}) — a rank failed to prepare or lineage diverged")
         cur_gen = next_gen
+
+        # Extent mode: drop the source gen's materialized chunk files (its
+        # extents remain) so committed generations stay extents-only at rest.
+        if storage_layout == "extents":
+            shutil.rmtree(src_dir / "chunks", ignore_errors=True)
 
         # Reclaim old generations (keep newest 3: current + 2 rollback targets).
         gm.prune(keep_generations=3)
@@ -1213,6 +1268,35 @@ def _committed_chunks_dir(work_dir: Path, rank: int, comm=None) -> Path:
     return rank_dir / f"state_{buf}" / "chunks"
 
 
+def _read_committed_logical_chunks(work_dir: Path, rank: int, comm) -> list:
+    """Return this rank's committed logical chunks as in-memory arrays.
+
+    Reads extents directly (no materialize-to-disk) for extent-backed gens, or
+    chunk files otherwise — so reading the committed state for norm/collect
+    never leaves stray chunk files behind (keeps the extent file-count win).
+    Must be called collectively (it uses the distributed gen resolver).
+    """
+    from wenbo_engine.recovery.rank_manifest import RankManifest
+    from wenbo_engine.storage import extent_store
+    chunks_dir = _committed_chunks_dir(work_dir, rank, comm)
+    gdir = chunks_dir.parent
+    if RankManifest.exists(gdir):
+        man = RankManifest.read(gdir)
+        if any(c.is_extent for c in man.chunks):
+            from wenbo_engine.storage.extent_manifest import ExtentManifest
+            em = ExtentManifest(n_chunks=man.n_chunks, n_extents=0,
+                                chunk_size=man.chunk_size)
+            from wenbo_engine.storage.extent_manifest import ExtentChunkRecord
+            for c in man.chunks:
+                em.records[c.index] = ExtentChunkRecord(
+                    chunk_id=c.index, extent_id=c.extent_id,
+                    offset=c.extent_offset, length=c.size_bytes,
+                    checksum=c.checksum or "")
+            return [extent_store.read_logical_chunk(gdir, em, c.index)
+                    for c in sorted(man.chunks, key=lambda x: x.index)]
+    return [read_chunk(f) for f in sorted(chunks_dir.glob("chunk_*.bin"))]
+
+
 def compute_norm(work_dir: str | Path,
                  comm: MPI.Comm | None = None) -> float:
     """Compute global state-vector norm across all ranks (distributed)."""
@@ -1220,11 +1304,9 @@ def compute_norm(work_dir: str | Path,
         comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     work_dir = Path(work_dir)
-    chunks_dir = _committed_chunks_dir(work_dir, rank, comm)
 
     local_norm_sq = 0.0
-    for chunk_file in sorted(chunks_dir.glob("chunk_*.bin")):
-        data = read_chunk(chunk_file)
+    for data in _read_committed_logical_chunks(work_dir, rank, comm):
         local_norm_sq += float(np.sum(np.abs(data.astype(np.complex128)) ** 2))
 
     global_norm_sq = np.array(0.0)
@@ -1240,11 +1322,9 @@ def collect_state(work_dir: str | Path,
         comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     work_dir = Path(work_dir)
-    chunks_dir = _committed_chunks_dir(work_dir, rank, comm)
 
-    local_chunks = sorted(chunks_dir.glob("chunk_*.bin"))
     local_state = np.concatenate(
-        [read_chunk(f) for f in local_chunks]
+        _read_committed_logical_chunks(work_dir, rank, comm)
     ).astype(np.complex128)
 
     all_states = comm.gather(local_state, root=0)

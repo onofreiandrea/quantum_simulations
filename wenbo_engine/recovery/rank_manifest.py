@@ -32,20 +32,34 @@ def _stable_hash(payload: dict) -> str:
 
 @dataclass
 class ChunkRecord:
-    """One chunk file written by a rank for a generation."""
+    """One logical chunk written by a rank for a generation.
+
+    In the *chunks* layout the chunk is its own file (``filename``).  In the
+    *extents* layout it is a slice of an extent file: ``extent_id`` is set and
+    ``extent_offset`` is its byte offset within ``extents/extent_<id>.dat``
+    (its byte length is ``size_bytes``).  The extent fields are omitted from
+    the serialized/hashed form when unset, so chunks-mode manifests (and their
+    hashes) are byte-identical to before.
+    """
 
     index: int          # local chunk index within the rank
-    filename: str       # e.g. "chunk_000000.bin"
-    size_bytes: int     # expected on-disk size
-    checksum: str | None = None   # sha256 hex of file bytes, if computed
+    filename: str       # e.g. "chunk_000000.bin" (logical name)
+    size_bytes: int     # chunk byte length
+    checksum: str | None = None   # sha256 hex of the chunk bytes, if computed
+    extent_id: int | None = None      # extents layout: which extent file
+    extent_offset: int | None = None  # extents layout: byte offset in extent
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "index": self.index,
             "filename": self.filename,
             "size_bytes": self.size_bytes,
             "checksum": self.checksum,
         }
+        if self.extent_id is not None:        # extents layout only
+            d["extent_id"] = self.extent_id
+            d["extent_offset"] = self.extent_offset
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "ChunkRecord":
@@ -54,7 +68,15 @@ class ChunkRecord:
             filename=str(d["filename"]),
             size_bytes=int(d["size_bytes"]),
             checksum=d.get("checksum"),
+            extent_id=(int(d["extent_id"]) if d.get("extent_id") is not None
+                       else None),
+            extent_offset=(int(d["extent_offset"])
+                           if d.get("extent_offset") is not None else None),
         )
+
+    @property
+    def is_extent(self) -> bool:
+        return self.extent_id is not None
 
 
 @dataclass
