@@ -177,6 +177,30 @@ def test_partial_upload_wrong_size_ignored(tmp_path):
     assert rm.latest_valid_durable_commit(check_checksums=True) is None
 
 
+def test_corrupt_chunk_same_size_detected_only_by_checksum(tmp_path):
+    """A chunk corrupted WITHOUT changing its size is caught by the checksum.
+
+    Size validation alone cannot see this (the byte count is unchanged); only
+    the sha256 check rejects it.  Proven by asserting it is *accepted* with
+    check_checksums=False and *rejected* with check_checksums=True.
+    """
+    work = tmp_path / "work"
+    gm, coord = _make_committed_run(work, n_gens=2)
+    backend = _backend(tmp_path)
+    rec = _promote(work, backend, coord, 1)
+
+    victim = rec.ranks[0].chunks[0].key
+    orig = backend.get(victim)
+    backend.put(victim, bytes((b ^ 0xFF) for b in orig))   # same length, different bytes
+    assert len(backend.get(victim)) == len(orig)            # size unchanged
+
+    rm = DurableRestoreManager(work, RUN_ID, backend, coord)
+    # size-only validation does not catch a same-size flip ...
+    assert rm.latest_valid_durable_commit(check_checksums=False) is not None
+    # ... but checksum validation does.
+    assert rm.latest_valid_durable_commit(check_checksums=True) is None
+
+
 # ── 4. corrupt durable manifest is ignored ──────────────────────────────
 
 def test_corrupt_durable_commit_record_ignored(tmp_path):
