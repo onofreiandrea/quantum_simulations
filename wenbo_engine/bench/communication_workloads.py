@@ -144,9 +144,8 @@ def _two(rng: np.random.RandomState, qa: int, qb: int) -> dict:
 # Non-Clifford primitives used:
 #   * RX/RY/RZ(θ), θ ∉ (π/2)ℤ   — arbitrary rotations (non-Clifford); already
 #                                 present in ``communication_light``
-#   * CR(k), k ≥ 2              — controlled phase 2π/2^k; only k=1 (CZ) is
-#                                 Clifford, k≥2 (controlled-S, controlled-T, …)
-#                                 is non-Clifford
+#   * CR(k), k ≥ 3              — controlled phase 2π/2^k; k=1→CZ, k=2→CS are
+#                                 Clifford, k≥3 (controlled-T, …) is non-Clifford
 #
 # ``_NONCLIFFORD_EVERY`` = 3 makes ~1/3 of a workload's gates non-Clifford on a
 # fixed, deterministic cadence (so at least one appears for any depth ≥ 1).
@@ -188,6 +187,10 @@ def communication_light(n: int, depth: int, seed: int = 42) -> dict:
     chunk-local positions under any reasonable partition); the remaining
     gates are local 2-qubit entanglers between adjacent low qubits.  No
     gate is placed on a high qubit, so MPI traffic stays minimal.
+
+    Non-Clifford content: the single-qubit ``_rot`` gates are arbitrary
+    ``RX/RY/RZ(θ)`` rotations on low/local bits, so this workload is already
+    non-stabilizer while staying MPI-light (no generator change needed).
     """
     if n < 1:
         raise ValueError("n must be >= 1")
@@ -542,6 +545,8 @@ class Metrics:
     barrier_count: int = 0
     bytes_read: int = 0
     bytes_written: int = 0
+    read_ops: int = 0          # # of chunk-file read_chunk calls
+    write_ops: int = 0         # # of chunk-file write_chunk_atomic calls (== temp chunk files)
     read_sec: float = 0.0
     write_sec: float = 0.0
     kernel_time: float = 0.0
@@ -562,6 +567,8 @@ class Metrics:
             "barrier_count": self.barrier_count,
             "bytes_read": self.bytes_read,
             "bytes_written": self.bytes_written,
+            "read_ops": self.read_ops,
+            "write_ops": self.write_ops,
             "read_sec": self.read_sec,
             "write_sec": self.write_sec,
             "kernel_time": self.kernel_time,
@@ -638,6 +645,7 @@ def _instrument_runner(metrics: Metrics):
             dt = time.perf_counter() - t0
             with metrics.lock:
                 metrics.bytes_read += int(np.asarray(data).nbytes)
+                metrics.read_ops += 1
                 metrics.read_sec += dt
             return data
         return w
@@ -650,6 +658,7 @@ def _instrument_runner(metrics: Metrics):
             dt = time.perf_counter() - t0
             with metrics.lock:
                 metrics.bytes_written += nbytes
+                metrics.write_ops += 1
                 metrics.write_sec += dt
             return r
         return w
@@ -738,7 +747,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                  mpi_exchange_mode: str = "naive",
                  storage_layout: str = "chunks",
                  execution_mode: str = "step",
-                 compute_unit_min_gates: int = 4) -> dict:
+                 compute_unit_min_gates: int = 4,
+                 extent_io_mode: str = "materialize") -> dict:
     """Run a communication workload under instrumentation.
 
     Builds the circuit, optionally applies production reordering
@@ -811,7 +821,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
             run(cd, work_dir, chunk_size=chunk_size, comm=pcomm,
                 recovery=recovery, mpi_exchange_mode=mpi_exchange_mode,
                 storage_layout=storage_layout, execution_mode=execution_mode,
-                compute_unit_min_gates=compute_unit_min_gates)
+                compute_unit_min_gates=compute_unit_min_gates,
+                extent_io_mode=extent_io_mode)
         elif recovery == "generation":
             raise RuntimeError(
                 "recovery='generation' requires the generation-recovery "
@@ -891,6 +902,7 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         "mpi_exchange_mode": mpi_exchange_mode,
         "storage_layout": storage_layout,
         "execution_mode": execution_mode,
+        "extent_io_mode": extent_io_mode,
         "overlay_metrics": overlay_metrics,
         "intended_locality": INTENDED_LOCALITY.get(kind, "unknown"),
         # Clifford / stabilizer analysis of the generated circuit
@@ -952,6 +964,8 @@ def _aggregate(all_metrics: list[dict]) -> dict:
         "barrier_count": mx("barrier_count"),
         "bytes_read": s("bytes_read"),
         "bytes_written": s("bytes_written"),
+        "read_ops": s("read_ops"),
+        "write_ops": s("write_ops"),
         "read_sec": mx("read_sec"),
         "write_sec": mx("write_sec"),
         "kernel_time": mx("kernel_time"),
@@ -1081,6 +1095,8 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         "planner_mode": result.get("planner_mode", "current"),
         "mpi_exchange_mode": result.get("mpi_exchange_mode", "naive"),
         "storage_layout": result.get("storage_layout", "chunks"),
+        "execution_mode": result.get("execution_mode", "step"),
+        "extent_io_mode": result.get("extent_io_mode", "materialize"),
         "intended_locality": result["intended_locality"],
         "runner": "mpi",
     }, indent=2))
@@ -1200,6 +1216,12 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         "mpi_exchange_mode": result.get("mpi_exchange_mode", "naive"),
         "storage_layout": result.get("storage_layout", "chunks"),
         "execution_mode": result.get("execution_mode", "step"),
+        "extent_io_mode": result.get("extent_io_mode", "materialize"),
+        # measured chunk-file I/O operation counts; write_ops == # temporary
+        # chunk files materialized (0 for fully-direct extent runs).
+        "read_ops": agg.get("read_ops", 0),
+        "write_ops": agg.get("write_ops", 0),
+        "temporary_chunk_files_created": agg.get("write_ops", 0),
         # Clifford / stabilizer analysis of the generated circuit
         "is_stabilizer": result.get("is_stabilizer"),
         "total_gate_count": result.get("total_gate_count"),
@@ -1303,6 +1325,13 @@ def main(argv: list[str] | None = None) -> None:
                     type=int, default=4,
                     help="min local gates to form a compute unit; shorter local "
                          "runs fall back to the step path (default 4).")
+    ap.add_argument("--extent-io-mode", dest="extent_io_mode",
+                    choices=["materialize", "direct"], default="materialize",
+                    help="extents + compute_unit only: materialize (default; "
+                         "round-trip through temp chunk files) or direct (read "
+                         "logical chunks straight from source extent slices and "
+                         "write dirty chunks straight into destination extents, "
+                         "no temp chunk files).")
     ap.add_argument("--verify", action="store_true",
                     help="collect full state and compare to ref_dense (small n)")
     ap.add_argument("--durable.enabled", dest="durable_enabled",
@@ -1363,6 +1392,7 @@ def main(argv: list[str] | None = None) -> None:
         storage_layout=args.storage_layout,
         execution_mode=args.execution_mode,
         compute_unit_min_gates=args.compute_unit_min_gates,
+        extent_io_mode=args.extent_io_mode,
     )
 
     if rank == 0:
