@@ -264,13 +264,32 @@ class GenerationManager:
     def __init__(self, work_dir: str | Path, coordinator: Coordinator, *,
                  circuit_hash: str, dtype: str = "complex64",
                  chunk_size: int = 0,
-                 events: RecoveryEventLog | None = None):
+                 events: RecoveryEventLog | None = None,
+                 fault_injector=None):
         self.work_dir = Path(work_dir)
         self.coord = coordinator
         self.circuit_hash = circuit_hash
         self.dtype = dtype
         self.chunk_size = chunk_size
         self.events = events or RecoveryEventLog()
+        # Deterministic fault injection (crash testing).  Defaults to the
+        # shared always-off injector so the hot path is a single ``enabled``
+        # check and all behaviour is unchanged when no fault is configured.
+        if fault_injector is None:
+            from wenbo_engine.faults.fault_injector import NULL_INJECTOR
+            fault_injector = NULL_INJECTOR
+        self.faults = fault_injector
+
+    # ── fault hook ─────────────────────────────────────────────────────
+
+    def _fault(self, fault_point, stage_id: int) -> None:
+        """Fire the configured fault iff it matches this protocol point.
+
+        No-op (one ``enabled`` check) when fault injection is disabled.  In
+        ``os_exit`` mode this does not return — it models a node dying at this
+        exact step of the commit protocol.
+        """
+        self.faults.maybe_fire(fault_point, self.coord.rank, stage_id)
 
     # ── run init ───────────────────────────────────────────────────────
 
@@ -322,18 +341,23 @@ class GenerationManager:
         (the generation it derives from and the circuit step that produced it).
         Returns the sealed :class:`RankManifest` (manifest.json on disk).
         """
+        from wenbo_engine.faults.fault_points import FaultPoint
         rank = self.coord.rank
         gdir = gen_dir(self.work_dir, rank, generation)
         cdir = gdir / CHUNKS_DIRNAME
         cdir.mkdir(parents=True, exist_ok=True)
 
+        self._fault(FaultPoint.BEFORE_STAGE, stage_id)   # before step 1
+
         records = write_chunks(cdir)          # steps 1–2,4 (atomic chunk writes)
+        self._fault(FaultPoint.AFTER_ALL_WRITES, stage_id)  # after step 2
         # Step 3: fsync chunk *data* to stable storage.  write_chunk_atomic
         # only renames (it does not fsync, to keep the WAL hot path fast), so
         # the commit protocol fsyncs the durable data here before the manifest.
         for rec in records:
             _fsync_file(cdir / rec.filename)
         _fsync_dir(cdir)                       # ensure chunk renames are durable
+        self._fault(FaultPoint.AFTER_RENAME, stage_id)   # after steps 3–4
 
         man = RankManifest(
             rank=rank,
@@ -347,8 +371,17 @@ class GenerationManager:
             chunks=sorted(records, key=lambda c: c.index),
             created=time.time(),
         )
-        man.write_atomic(gdir)                 # steps 5–7
+        # Steps 5–7.  ``after_tmp_fsync`` fires AFTER_MANIFEST_WRITE between the
+        # fsync of manifest.tmp (step 6) and its rename to manifest.json (step
+        # 7): a crash here leaves manifest.tmp on disk but NO manifest.json, so
+        # recovery must still roll back to the previous generation.
+        man.write_atomic(
+            gdir,
+            after_tmp_fsync=lambda: self._fault(
+                FaultPoint.AFTER_MANIFEST_WRITE, stage_id),
+        )
         _fsync_dir(gdir)
+        self._fault(FaultPoint.AFTER_MANIFEST_RENAME, stage_id)  # after step 7
         self.events.emit(EventType.GENERATION_PREPARED,
                          "rank prepared generation",
                          generation=generation, rank=rank,
@@ -377,14 +410,30 @@ class GenerationManager:
             stage_id=prepared.stage_id if prepared else -2,
         )
 
+        from wenbo_engine.faults.fault_points import FaultPoint
+
         gathered = self.coord.gather(status)   # step 8
+        # After the coordinator has gathered every rank's prepared status but
+        # before any commit record is written.
+        self._fault(FaultPoint.AFTER_ALLGATHER_PREPARED, step_index)
 
         record: GlobalCommitRecord | None = None
         if self.coord.is_coordinator:
+            # Just before steps 9–11 write/rename the global commit record:
+            # a crash here means the generation is NOT durable → roll back.
+            self._fault(FaultPoint.BEFORE_GLOBAL_COMMIT, step_index)
             record = self._coordinator_commit(
                 generation, step_index, parent_generation, gathered)
+            # Steps 9–11 done: commit_XXXXXX.json is on disk and durable.  A
+            # crash here means the new generation IS committed → recover it.
+            if record is not None:
+                self._fault(FaultPoint.AFTER_GLOBAL_COMMIT, step_index)
 
+        # Step 12: broadcast the (committed) record to all ranks.
+        self._fault(FaultPoint.DURING_DURABLE_UPLOAD, step_index)
         record = self.coord.broadcast(record)  # step 12
+        # Just before step 13 installs g+1 as the live source on each rank.
+        self._fault(FaultPoint.BEFORE_DURABLE_COMMIT, step_index)
 
         if record is not None:                 # step 13
             self.events.emit(EventType.GENERATION_INSTALLED,
