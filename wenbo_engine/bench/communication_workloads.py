@@ -188,9 +188,15 @@ def communication_light(n: int, depth: int, seed: int = 42) -> dict:
     gates are local 2-qubit entanglers between adjacent low qubits.  No
     gate is placed on a high qubit, so MPI traffic stays minimal.
 
-    Non-Clifford content: the single-qubit ``_rot`` gates are arbitrary
-    ``RX/RY/RZ(θ)`` rotations on low/local bits, so this workload is already
-    non-stabilizer while staying MPI-light (no generator change needed).
+    Non-Clifford content: the random single-qubit ``_rot`` gates are arbitrary
+    ``RX/RY/RZ(θ)`` rotations on low/local bits, so the circuit is non-stabilizer
+    for the default seeds — but that is *probabilistic*.  To guarantee benchmark
+    hardness for ANY seed/depth, the first gate is deterministically forced to an
+    explicit non-Clifford gate (RZ(π/7) for a 1-qubit slot, CR(3) for a 2-qubit
+    slot) on the SAME qubit(s) and with the SAME arity it would otherwise have.
+    Reusing the qubits keeps the levelization / locality class / compute-unit
+    fusion byte-identical — only the gate's matrix changes — so the workload
+    stays local (``mpi_nonlocal == 0``) and the long local run is preserved.
     """
     if n < 1:
         raise ValueError("n must be >= 1")
@@ -205,6 +211,18 @@ def communication_light(n: int, depth: int, seed: int = 42) -> dict:
         else:
             q = _pick(rng, 0, low)
             gates.append(_rot(rng, q) if rng.random() < 0.5 else _h(q))
+
+    # Deterministic non-Clifford guarantee: replace the first gate in place with
+    # an explicit non-Clifford gate of the same arity on the same qubit(s).  This
+    # preserves the qubit-dependency structure exactly (levels, locality counts,
+    # compute-unit fusion) while making the circuit non-stabilizer for every seed.
+    if gates:
+        qs = gates[0]["qubits"]
+        if len(qs) == 1:
+            gates[0] = {"qubits": list(qs), "gate": "RZ",
+                        "params": {"theta": math.pi / 7}}
+        else:
+            gates[0] = {"qubits": list(qs), "gate": "CR", "params": {"k": 3}}
     return {"number_of_qubits": n, "gates": gates}
 
 
