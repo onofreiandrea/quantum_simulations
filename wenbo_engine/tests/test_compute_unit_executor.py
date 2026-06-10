@@ -122,6 +122,28 @@ def test_scheduler_fuses_local_runs():
     assert [u.dst_generation for u in units] == [1, 2, 3]
 
 
+def test_communication_light_fuses_into_long_local_run():
+    """communication_light is all-local, so after the deterministic non-Clifford
+    guarantee it still fuses into a single long local compute unit (no fallback,
+    no MPI/rank-nonlocal steps)."""
+    from wenbo_engine.bench.communication_workloads import communication_light
+    from wenbo_engine.mpi.mpi_runner import (
+        _compile_steps, validate_circuit_dict,
+    )
+    from wenbo_engine.circuit.io import levelize
+    n, depth, k, n_local_bits = 8, 30, 4, 2
+    cd = validate_circuit_dict(communication_light(n, depth, seed=42))
+    steps = _compile_steps(levelize(cd), k, n_local_bits)
+    # every step is local-only (no rank/MPI ops) — the workload stays MPI-light
+    assert all(not s["rank_nonlocal_ops"] and not s["mpi_nonlocal_ops"] for s in steps)
+    units = build_compute_units(steps, rank=0, n_chunks_per_rank=4, start_gen=0,
+                                min_gates=4)
+    assert len(units) == 1                       # one fused unit
+    assert units[0].kind == "local" and not units[0].fallback
+    assert units[0].n_steps == len(steps)        # the whole long local run
+    assert units[0].gate_count == depth          # all gates fused, count preserved
+
+
 # ── 12. partial output is not committed without a global commit ─────────
 
 def test_partial_unit_output_not_committed(tmp_path):

@@ -48,6 +48,22 @@ def test_workload_is_non_stabilizer(kind):
     assert stats["non_clifford_gate_types"], kind
 
 
+# ── communication_light: DETERMINISTICALLY non-stabilizer (every seed) ──
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 7, 13, 42, 99, 123, 1000, 2024])
+@pytest.mark.parametrize("depth", [1, 2, 5, 20, 50])
+def test_communication_light_deterministic_non_stabilizer(seed, depth):
+    """Non-stabilizer for ANY seed/depth, not just the default ones."""
+    cd = communication_light(N, depth, seed=seed)
+    stats = circuit_clifford_stats(cd)
+    assert stats["is_stabilizer"] is False, (seed, depth)
+    assert stats["non_clifford_gate_count"] > 0, (seed, depth)
+    # locality unchanged: all-local, zero MPI traffic, gate count preserved
+    loc = classify_circuit(cd, CHUNK_BITS, NUM_RANKS)
+    assert loc["mpi_nonlocal_gate_count"] == 0, (seed, depth)
+    assert loc["local_gate_count"] == depth, (seed, depth)
+
+
 # ── mixed_staged: non-Clifford in EACH locality phase ───────────────────
 
 def test_mixed_staged_non_clifford_in_every_phase():
