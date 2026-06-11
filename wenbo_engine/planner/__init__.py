@@ -65,6 +65,11 @@ from wenbo_engine.planner.recovery_aware_planner import (
     selected_run_params,
 )
 from wenbo_engine.planner.cost_report import build_cost_report
+from wenbo_engine.planner.mpi_window_report import (
+    build_window_report,
+    report_to_candidates_json,
+    report_to_summary_json,
+)
 
 # ── Capacity planner ────────────────────────────────────────────────────
 from wenbo_engine.planner.capacity_planner import (
@@ -110,6 +115,10 @@ __all__ = [
     "build_plan_context",
     "selected_run_params",
     "build_cost_report",
+    # MPI-window feasibility (analysis-only)
+    "build_window_report",
+    "report_to_candidates_json",
+    "report_to_summary_json",
     "serialize_recovery_aware_plan",
     "serialize_candidate_strategies",
     "recovery_aware_plan_to_json",
