@@ -780,7 +780,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                  ram_budget_gib: float | None = None,
                  auto_chunk_bits: bool = False,
                  max_overlay_chunks: int | None = None,
-                 max_remote_buffer_gib: float | None = None) -> dict:
+                 max_remote_buffer_gib: float | None = None,
+                 kernel_backend: str = "auto") -> dict:
     """Run a communication workload under instrumentation.
 
     Builds the circuit, optionally applies production reordering
@@ -911,7 +912,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                 ram_budget_gib=ram_budget_resolved,
                 max_overlay_chunks=max_overlay_chunks,
                 max_remote_buffer_gib=max_remote_buffer_gib,
-                auto_chunk_bits=auto_chunk_bits)
+                auto_chunk_bits=auto_chunk_bits,
+                kernel_backend=kernel_backend)
         elif recovery == "generation":
             raise RuntimeError(
                 "recovery='generation' requires the generation-recovery "
@@ -935,6 +937,14 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
             overlay_metrics = {}
 
     # RAM-aware execution metrics (budgets + measured peaks), written by run().
+    kernel_metrics = {}
+    km_path = Path(work_dir) / "kernel_metrics.json"
+    if km_path.exists():
+        try:
+            kernel_metrics = json.loads(km_path.read_text())
+        except (OSError, ValueError):
+            kernel_metrics = {}
+
     ram_metrics = {}
     rm_path = Path(work_dir) / "ram_metrics.json"
     if rm_path.exists():
@@ -1003,6 +1013,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         "extent_io_mode": extent_io_mode,
         "overlay_metrics": overlay_metrics,
         "ram_metrics": ram_metrics,
+        "kernel_metrics": kernel_metrics,
+        "kernel_backend_requested": kernel_backend,
         "auto_chunk_bits_enabled": bool(auto_chunk_bits),
         "intended_locality": INTENDED_LOCALITY.get(kind, "unknown"),
         # Clifford / stabilizer analysis of the generated circuit
@@ -1443,6 +1455,16 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
     required["estimated_peak_ram_gib"] = _raram.get("estimated_peak_ram_gib")
     required["recommended_chunk_bits"] = _raram.get("recommended_chunk_bits")
 
+    # ── numerical backend fields ──
+    _km = result.get("kernel_metrics") or {}
+    required["kernel_backend_requested"] = _km.get(
+        "kernel_backend_requested", result.get("kernel_backend_requested"))
+    required["kernel_backend_used"] = _km.get("kernel_backend_used")
+    required["kernel_backend_available"] = _km.get("kernel_backend_available")
+    required["numba_compile_time"] = _km.get("numba_compile_time")
+    required["backend_fallback_reason"] = _km.get("backend_fallback_reason")
+    required["kernel_time"] = agg["kernel_time"]
+
     if "correct" in result:
         required["correct"] = result["correct"]
     try:
@@ -1558,6 +1580,11 @@ def main(argv: list[str] | None = None) -> None:
                     type=float, default=None,
                     help="cap the gate-aware remote-buffer cache (GiB/rank); "
                          "default: 25%% of the RAM budget.")
+    ap.add_argument("--kernel-backend", dest="kernel_backend",
+                    choices=["numpy", "numba", "auto"], default="auto",
+                    help="CPU kernel numerical backend: numpy (baseline) | numba "
+                         "(JIT, if installed) | auto (numba when available, else "
+                         "numpy). auto/numba fall back to numpy safely.")
     ap.add_argument("--verify", action="store_true",
                     help="collect full state and compare to ref_dense (small n)")
     ap.add_argument("--durable.enabled", dest="durable_enabled",
@@ -1623,6 +1650,7 @@ def main(argv: list[str] | None = None) -> None:
         max_overlay_chunks=args.max_overlay_chunks,
         max_remote_buffer_gib=args.max_remote_buffer_gib,
         extent_io_mode=args.extent_io_mode,
+        kernel_backend=args.kernel_backend,
     )
 
     if rank == 0:

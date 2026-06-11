@@ -359,6 +359,12 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
         _extra["auto_chunk_bits_enabled"] = bool(getattr(cfg, "auto_chunk_bits", False))
         _extra["ram_budget_gib"] = getattr(cfg, "ram_budget_gib", None)
         try:
+            _kmj = json.loads((work_dir / "kernel_metrics.json").read_text())
+            for _kk in ("kernel_backend_requested","kernel_backend_used","kernel_backend_available","numba_compile_time","backend_fallback_reason"):
+                _extra[_kk] = _kmj.get(_kk)
+        except (OSError, ValueError):
+            pass
+        try:
             _rm = json.loads((work_dir / "ram_metrics.json").read_text())
             for _k in ("chunk_bits", "chunk_bytes", "max_overlay_chunks",
                        "max_remote_buffer_gib", "overlay_peak_ram_gib",
@@ -449,7 +455,8 @@ def _run_mpi(cfg, circuit, work_dir, chunk_size, run_dir, comm, n_ranks, rank):
                    ram_budget_gib=getattr(cfg, "ram_budget_gib", None),
                    max_overlay_chunks=getattr(cfg, "max_overlay_chunks", None),
                    max_remote_buffer_gib=getattr(cfg, "max_remote_buffer_gib", None),
-                   auto_chunk_bits=bool(getattr(cfg, "auto_chunk_bits", False)))
+                   auto_chunk_bits=bool(getattr(cfg, "auto_chunk_bits", False)),
+                   kernel_backend=getattr(cfg, "kernel_backend", "auto"))
     comm.Barrier()
 
     # Durable R4: promote committed generations to durable storage AFTER the
@@ -656,6 +663,9 @@ def main(argv=None) -> int:
                     default=None)
     ap.add_argument("--max-remote-buffer-gib", dest="max_remote_buffer_gib",
                     type=float, default=None)
+    ap.add_argument("--kernel-backend", dest="kernel_backend",
+                    choices=["numpy", "numba", "auto"], default="auto",
+                    help="CPU kernel backend: numpy|numba|auto (safe fallback).")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -677,6 +687,7 @@ def main(argv=None) -> int:
     cfg.auto_chunk_bits = args.auto_chunk_bits
     cfg.max_overlay_chunks = args.max_overlay_chunks
     cfg.max_remote_buffer_gib = args.max_remote_buffer_gib
+    cfg.kernel_backend = args.kernel_backend
     cfg.validate()
 
     run_dir = run_experiment(cfg, run_id=args.run_id)

@@ -299,3 +299,38 @@ def test_compute_unit_bounded_overlay_correct_and_low_peak(tmp_path):
         expect = base[c].copy(); _apply_local_ops(expect, ops)
         got = read_chunk(tmp_path / "g1" / "chunks" / chunk_filename(c))
         assert np.allclose(got, expect, atol=1e-6)
+
+
+# ── backend selection: compute unit correct under numpy and numba ───────
+
+def test_compute_unit_backend_selection_equivalent(tmp_path):
+    from wenbo_engine.kernel import backend
+    from wenbo_engine.runtime.compute_unit import ComputeUnit, execute_local_unit
+    n_chunks, cs = 4, 8
+    rng = np.random.default_rng(11)
+    base = {}
+    for c in range(n_chunks):
+        base[c] = (rng.standard_normal(cs) + 1j*rng.standard_normal(cs)).astype(DTYPE)
+    H = gmod.gate_matrix("H", {}).astype(DTYPE)
+    ops = [([0], H), ([1], H)]
+    results = {}
+    backends = ["numpy", "numba"] if backend.numba_available() else ["numpy"]
+    try:
+        for be in backends:
+            backend.set_backend(be)
+            src = tmp_path / f"g0_{be}" / "chunks"; src.mkdir(parents=True)
+            for c in range(n_chunks):
+                write_chunk_atomic(src / chunk_filename(c), base[c].copy())
+            unit = ComputeUnit(compute_unit_id=0, kind="local", src_generation=0,
+                               dst_generation=1, rank=0,
+                               chunk_ids=list(range(n_chunks)), local_ops=ops)
+            execute_local_unit(unit, src, tmp_path / f"g1_{be}" / "chunks",
+                               _apply_local_ops)
+            results[be] = [read_chunk(tmp_path / f"g1_{be}" / "chunks" / chunk_filename(c))
+                           for c in range(n_chunks)]
+            assert all(r.dtype == DTYPE for r in results[be])   # precision kept
+    finally:
+        backend.set_backend("numpy")
+    if "numba" in results:
+        for c in range(n_chunks):
+            assert np.allclose(results["numpy"][c], results["numba"][c], atol=1e-5)
