@@ -23,6 +23,8 @@ from wenbo_engine.planner.capacity_planner import (
     max_feasible_qubits,
     plan,
     recommend_recovery_mode,
+    recommend_chunk_bits,
+    estimate_peak_ram,
     state_size_bytes,
 )
 
@@ -477,3 +479,65 @@ def test_recommended_config_carries_durable_warning():
     rc = out["recommended_config"]
     assert rc["durable_snapshots_retained"] >= 1
     assert any("durable" in w for w in rc["warnings"])
+
+
+# ── RAM working-set model (ram-aware execution) ──────────────────────────
+
+def _cluster_cfg(**kw):
+    # 8 x i3en.xlarge: 2.2 TiB NVMe / 30 GiB RAM per rank, generation recovery.
+    base = dict(precision="complex64", num_ranks=8,
+                local_storage_per_rank_tib=2.2, ram_per_rank_gib=30.0,
+                recovery_mode="generation")
+    base.update(kw)
+    return PlannerConfig(**base)
+
+
+def test_storage_and_ram_feasibility_reported_separately():
+    # case 1: both verdicts present and independent
+    f = evaluate_qubits(_cluster_cfg(), 36)
+    assert f.storage_feasible is True            # NVMe has ample room
+    assert f.ram_feasible is False               # but RAM working set does not
+    assert f.storage_feasible != f.ram_feasible
+    out = plan(_cluster_cfg(), num_qubits=36)["requested"]
+    assert "storage_feasible" in out and "ram_feasible" in out
+    assert out["storage_feasible"] is True and out["ram_feasible"] is False
+
+
+def test_n38_storage_feasible_but_ram_infeasible():
+    # case 2: n=38 fits storage (8x2.2TiB) but not RAM (30GiB) at default chunk_bits
+    f = evaluate_qubits(_cluster_cfg(), 38)
+    assert f.storage_feasible is True
+    assert f.ram_feasible is False
+    assert f.estimated_peak_ram_bytes > f.ram_working_budget_bytes
+
+
+def test_auto_chunk_bits_recommends_smaller_chunk_bits():
+    # case 3: auto-chunk-bits recommends a smaller chunk_bits that fits RAM
+    default_cb = evaluate_qubits(_cluster_cfg(), 36).chunk_bits
+    f = evaluate_qubits(_cluster_cfg(auto_chunk_bits=True, ram_budget_gib=21.0,
+                                     has_mpi=False), 36)
+    assert f.recommended_chunk_bits is not None
+    assert f.recommended_chunk_bits < default_cb
+    assert f.ram_feasible is True                 # at the recommended chunk_bits
+    assert f.estimated_peak_ram_bytes <= f.ram_working_budget_bytes
+    # and n=34 mpi (step) likewise gets a feasible recommendation
+    g = evaluate_qubits(_cluster_cfg(auto_chunk_bits=True, ram_budget_gib=21.0,
+                                     execution_mode="step", has_mpi=True), 34)
+    assert g.recommended_chunk_bits is not None and g.ram_feasible is True
+
+
+def test_recommend_chunk_bits_none_when_budget_too_small():
+    # a 0.4 GiB budget cannot even hold metadata + 1 chunk -> None
+    rec = recommend_chunk_bits(num_qubits=30, num_ranks=8,
+                               ram_budget_bytes=int(0.4 * GIB),
+                               execution_mode="compute_unit", has_mpi=False)
+    assert rec is None
+
+
+def test_estimate_peak_ram_unbounded_vs_bounded():
+    # unbounded overlay holds the whole partition; bounded streams (much less)
+    common = dict(num_qubits=34, num_ranks=8, chunk_bits=29,
+                  execution_mode="compute_unit", has_mpi=False)
+    unb = estimate_peak_ram(bounded_overlay=False, **common)
+    bnd = estimate_peak_ram(bounded_overlay=True, **common)
+    assert unb["estimated_peak_ram_bytes"] > bnd["estimated_peak_ram_bytes"]

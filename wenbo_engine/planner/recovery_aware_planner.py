@@ -200,10 +200,53 @@ def _stage_plans_for(selected: StrategyCandidate, ctx: PlanContext
     return plans
 
 
+def _ram_block(*, n: int, chunk_bits: int, num_ranks: int, selected: dict,
+               has_mpi: bool, ram_budget_gib: float | None,
+               max_overlay_chunks: int | None,
+               max_remote_buffer_gib: float | None,
+               auto_chunk_bits: bool) -> dict:
+    """RAM working-set model for the SELECTED strategy (capacity_planner)."""
+    from wenbo_engine.planner import capacity_planner as cap
+    exec_mode = selected["execution_mode"]
+    mpi_mode = selected["mpi_exchange_mode"]
+    budget_bytes = (ram_budget_gib * cap.GIB) if ram_budget_gib else 0.0
+    max_remote_bytes = (max_remote_buffer_gib * cap.GIB
+                        if max_remote_buffer_gib is not None else None)
+    recommended = None
+    if budget_bytes > 0:
+        recommended = cap.recommend_chunk_bits(
+            num_qubits=n, num_ranks=num_ranks, ram_budget_bytes=budget_bytes,
+            execution_mode=exec_mode, mpi_exchange_mode=mpi_mode,
+            max_overlay_chunks=max_overlay_chunks,
+            max_remote_buffer_bytes=max_remote_bytes, has_mpi=has_mpi)
+    eff_cb = recommended if (auto_chunk_bits and recommended) else chunk_bits
+    est = cap.estimate_peak_ram(
+        num_qubits=n, num_ranks=num_ranks, chunk_bits=eff_cb,
+        execution_mode=exec_mode, mpi_exchange_mode=mpi_mode,
+        bounded_overlay=auto_chunk_bits, max_overlay_chunks=max_overlay_chunks,
+        max_remote_buffer_bytes=max_remote_bytes, has_mpi=has_mpi)
+    peak = est["estimated_peak_ram_bytes"]
+    return {
+        "chunk_bits": eff_cb,
+        "recommended_chunk_bits": recommended,
+        "estimated_peak_ram_gib": round(peak / cap.GIB, 4),
+        "ram_budget_gib": ram_budget_gib,
+        "ram_feasible": (budget_bytes <= 0) or (peak <= budget_bytes),
+        "auto_chunk_bits_enabled": bool(auto_chunk_bits),
+        "has_mpi": has_mpi,
+        "components_gib": {k: round(v / cap.GIB, 4) for k, v in est.items()
+                           if k.endswith("_bytes")},
+    }
+
+
 def plan_recovery_aware(circuit_dict: dict, *, n: int, chunk_bits: int,
                         num_ranks: int, recovery: str,
                         compute_unit_min_gates: int = 4,
-                        cost_model: dict | None = None) -> dict:
+                        cost_model: dict | None = None,
+                        ram_budget_gib: float | None = None,
+                        max_overlay_chunks: int | None = None,
+                        max_remote_buffer_gib: float | None = None,
+                        auto_chunk_bits: bool = False) -> dict:
     """Run the full recovery-aware planner; return the plan + decision dict."""
     ctx = build_plan_context(
         circuit_dict, n=n, chunk_bits=chunk_bits, num_ranks=num_ranks,
@@ -218,6 +261,14 @@ def plan_recovery_aware(circuit_dict: dict, *, n: int, chunk_bits: int,
     sel_name = decision["selected_strategy"]["name"]
     selected = next(c for c in candidates if c.name == sel_name)
     stage_plans = _stage_plans_for(selected, ctx)
+
+    ram = _ram_block(
+        n=n, chunk_bits=chunk_bits, num_ranks=num_ranks,
+        selected=decision["selected_strategy"],
+        has_mpi=ctx.total_mpi_ops > 0, ram_budget_gib=ram_budget_gib,
+        max_overlay_chunks=max_overlay_chunks,
+        max_remote_buffer_gib=max_remote_buffer_gib,
+        auto_chunk_bits=auto_chunk_bits)
 
     return {
         "planner": PLANNER_NAME,
@@ -239,6 +290,7 @@ def plan_recovery_aware(circuit_dict: dict, *, n: int, chunk_bits: int,
         "decision": decision,
         "candidates": estimates,
         "stage_plans": [sp.to_dict() for sp in stage_plans],
+        "ram": ram,
     }
 
 

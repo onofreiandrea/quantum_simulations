@@ -48,6 +48,104 @@ from wenbo_engine.storage.block_store import (
 log = logging.getLogger(__name__)
 
 
+# ── per-run RAM budgets (per-process; set by run(), one run per process) ──
+# 0 == unbounded (legacy behaviour).  These bound the compute-unit overlay
+# (chunks resident) and the gate-aware remote-buffer cache (bytes), and record
+# observed peaks so the bench can report overlay_peak_ram_gib / remote_peak.
+_RAM = {
+    "overlay_budget_chunks": 0,
+    "remote_buffer_max_bytes": 0,
+    "overlay_peak_bytes": 0,
+    "remote_peak_bytes": 0,
+}
+
+
+def _reset_ram_budgets(overlay_budget_chunks: int = 0,
+                       remote_buffer_max_bytes: int = 0) -> None:
+    _RAM["overlay_budget_chunks"] = int(overlay_budget_chunks)
+    _RAM["remote_buffer_max_bytes"] = int(remote_buffer_max_bytes)
+    _RAM["overlay_peak_bytes"] = 0
+    _RAM["remote_peak_bytes"] = 0
+
+
+# fraction of the RAM budget reserved for the overlay working set (the rest is
+# headroom for MPI send/recv buffers + remote cache + python/runtime overhead).
+_OVERLAY_BUDGET_FRACTION = 0.75
+_REMOTE_BUDGET_FRACTION = 0.25
+
+
+def _apply_ram_budgets(*, chunk_size: int, ram_budget_gib: float | None,
+                       max_overlay_chunks: int | None,
+                       max_remote_buffer_gib: float | None) -> dict:
+    """Resolve per-rank RAM budgets and install them; fail early if infeasible.
+
+    Converts an optional ``ram_budget_gib`` into a compute-unit overlay budget
+    (resident chunks) and a gate-aware remote-buffer-cache byte cap, and raises
+    a clear ``RuntimeError`` BEFORE any large allocation if a single chunk plus
+    its kernel temporary cannot fit the budget (the OOM the ladder hit).
+    Returns a metadata dict for the run's RAM report.
+    """
+    from wenbo_engine.planner.capacity_planner import (
+        GIB, NUMPY_TEMP_FACTOR,
+    )
+    itemsize = np.dtype(DTYPE).itemsize
+    chunk_bytes = chunk_size * itemsize
+    chunk_bits = max(0, chunk_size.bit_length() - 1)
+    per_chunk_peak = chunk_bytes * (1.0 + NUMPY_TEMP_FACTOR)
+
+    if ram_budget_gib is not None and ram_budget_gib > 0:
+        budget = ram_budget_gib * GIB
+        if per_chunk_peak > budget:
+            raise RuntimeError(
+                f"RAM-infeasible: one chunk ({chunk_bytes / GIB:.2f} GiB, "
+                f"chunk_bits={chunk_bits}) plus its kernel temporary needs "
+                f"{per_chunk_peak / GIB:.2f} GiB but the per-rank RAM budget is "
+                f"{ram_budget_gib:.2f} GiB. Lower --chunk-bits or enable "
+                f"--auto-chunk-bits, add ranks, or raise --ram-budget-gib.")
+        overlay_budget = (max_overlay_chunks if max_overlay_chunks
+                          else max(1, int((budget * _OVERLAY_BUDGET_FRACTION)
+                                          // per_chunk_peak)))
+        remote_max = (max_remote_buffer_gib * GIB
+                      if max_remote_buffer_gib is not None
+                      else budget * _REMOTE_BUDGET_FRACTION)
+    else:
+        budget = 0.0
+        overlay_budget = max_overlay_chunks or 0
+        remote_max = (max_remote_buffer_gib * GIB
+                      if max_remote_buffer_gib is not None else 0)
+
+    _reset_ram_budgets(int(overlay_budget), int(remote_max))
+    return {
+        "ram_budget_gib": (None if not budget else round(budget / GIB, 4)),
+        "chunk_bits": chunk_bits,
+        "chunk_bytes": chunk_bytes,
+        "max_overlay_chunks": int(overlay_budget) if overlay_budget else None,
+        "max_remote_buffer_gib": (round(remote_max / GIB, 4) if remote_max
+                                  else None),
+    }
+
+
+def _write_ram_metrics(work_dir, comm, ram_meta: dict) -> None:
+    """Write ram_metrics.json (rank 0) with the run's RAM budgets + peaks."""
+    if comm is not None and comm.Get_rank() != 0:
+        return
+    from wenbo_engine.planner.capacity_planner import GIB
+    out = dict(ram_meta)
+    out["overlay_peak_ram_gib"] = round(_RAM["overlay_peak_bytes"] / GIB, 4)
+    out["remote_buffer_peak_gib"] = round(_RAM["remote_peak_bytes"] / GIB, 4)
+    # measured peak working set (overlay/step resident + remote cache); a
+    # conservative observed lower bound on true peak RAM.
+    measured_peak = _RAM["overlay_peak_bytes"] + _RAM["remote_peak_bytes"]
+    out["measured_peak_working_set_gib"] = round(measured_peak / GIB, 4)
+    budget = ram_meta.get("ram_budget_gib")
+    out["ram_feasible"] = (budget is None
+                           or measured_peak <= budget * GIB)
+    try:
+        (Path(work_dir) / "ram_metrics.json").write_text(json.dumps(out))
+    except OSError:
+        pass
+
+
 # ── helpers ────────────────────────────────────────────────────────────
 
 def _circuit_hash(circuit_dict: dict) -> str:
@@ -809,10 +907,12 @@ def _apply_step(comm: MPI.Comm, rank: int, n_local_bits: int,
         from wenbo_engine.mpi.remote_buffer_cache import RemoteBufferCache
         plan = plan_stage(mpi_nonlocal_ops, rank, k, n_local_bits,
                           n_chunks_per_rank)
-        cache = RemoteBufferCache()
+        cache = RemoteBufferCache(max_bytes=_RAM["remote_buffer_max_bytes"])
         fallback = apply_stage_gate_aware(
             comm, plan, dst_dir, chunk_size,
             default_batch_chunks(chunk_size), cache)
+        if cache.peak_bytes > _RAM["remote_peak_bytes"]:
+            _RAM["remote_peak_bytes"] = cache.peak_bytes
         cache.clear()
         for ge in fallback:
             _apply_mpi_gate(comm, rank, n_local_bits, dst_dir,
@@ -842,6 +942,10 @@ def run(
     execution_mode: str = "step",
     compute_unit_min_gates: int = 4,
     extent_io_mode: str = "materialize",
+    ram_budget_gib: float | None = None,
+    max_overlay_chunks: int | None = None,
+    max_remote_buffer_gib: float | None = None,
+    auto_chunk_bits: bool = False,
 ) -> Path:
     """Run a quantum circuit distributed across MPI ranks.
 
@@ -868,14 +972,27 @@ def run(
     if recovery not in ("none", "wal", "generation"):
         raise ValueError(f"unknown recovery mode {recovery!r} "
                          "(expected none|wal|generation)")
+
+    # RAM-aware execution control: resolve per-rank overlay + remote-cache
+    # budgets and FAIL EARLY (before any large allocation) if a single chunk +
+    # kernel temp cannot fit the budget.  No-op when ram_budget_gib is None
+    # (legacy/unbounded behaviour preserved).
+    ram_meta = _apply_ram_budgets(
+        chunk_size=chunk_size, ram_budget_gib=ram_budget_gib,
+        max_overlay_chunks=max_overlay_chunks,
+        max_remote_buffer_gib=max_remote_buffer_gib)
+    ram_meta["auto_chunk_bits_enabled"] = bool(auto_chunk_bits)
+
     if recovery == "generation":
-        return _run_generation(circuit_dict, work_dir, chunk_size, comm,
-                               buffer_depth, fault_injector=fault_injector,
-                               mpi_exchange_mode=mpi_exchange_mode,
-                               storage_layout=storage_layout,
-                               execution_mode=execution_mode,
-                               compute_unit_min_gates=compute_unit_min_gates,
-                               extent_io_mode=extent_io_mode)
+        result = _run_generation(circuit_dict, work_dir, chunk_size, comm,
+                                 buffer_depth, fault_injector=fault_injector,
+                                 mpi_exchange_mode=mpi_exchange_mode,
+                                 storage_layout=storage_layout,
+                                 execution_mode=execution_mode,
+                                 compute_unit_min_gates=compute_unit_min_gates,
+                                 extent_io_mode=extent_io_mode)
+        _write_ram_metrics(work_dir, comm, ram_meta)
+        return result
     # none / wal share the double-buffer path; WAL writes are gated below.
     use_wal = (recovery == "wal")
 
@@ -1014,6 +1131,7 @@ def run(
             comm.Barrier()
             os._exit(1)
 
+    _write_ram_metrics(work_dir, comm, ram_meta)
     return src_dir  # committed state directory
 
 
@@ -1075,7 +1193,8 @@ def _run_compute_units(gm, comm, rank, work, steps, cur_gen,
     )
     units = build_compute_units(
         steps, rank=rank, n_chunks_per_rank=n_chunks_per_rank, start_gen=0,
-        ram_budget_chunks=0, storage_layout=storage_layout, min_gates=min_gates)
+        ram_budget_chunks=_RAM["overlay_budget_chunks"],
+        storage_layout=storage_layout, min_gates=min_gates)
     om = OverlayMetrics(min_gates=min_gates)
     for unit in units:
         if unit.dst_generation <= cur_gen:
@@ -1098,6 +1217,8 @@ def _run_compute_units(gm, comm, rank, work, steps, cur_gen,
                 unit, src_dir, dst_dir, src_records, _apply_local_ops,
                 chunk_size=chunk_size)
             om.record_unit(unit, overlay)
+            if overlay.peak_resident_bytes > _RAM["overlay_peak_bytes"]:
+                _RAM["overlay_peak_bytes"] = overlay.peak_resident_bytes
             _direct_recs = [ChunkRecord(
                 index=ci, filename=chunk_filename(ci),
                 size_bytes=ext_man.records[ci].length,
@@ -1119,6 +1240,8 @@ def _run_compute_units(gm, comm, rank, work, steps, cur_gen,
                 overlay = execute_local_unit(
                     unit, src_dir / "chunks", dst_dir / "chunks", _apply_local_ops)
                 om.record_unit(unit, overlay)
+                if overlay.peak_resident_bytes > _RAM["overlay_peak_bytes"]:
+                    _RAM["overlay_peak_bytes"] = overlay.peak_resident_bytes
             else:
                 s = unit.step
                 _apply_step(comm, rank, n_local_bits, src_dir, dst_dir,
@@ -1418,13 +1541,14 @@ def _committed_chunks_dir(work_dir: Path, rank: int, comm=None) -> Path:
     return rank_dir / f"state_{buf}" / "chunks"
 
 
-def _read_committed_logical_chunks(work_dir: Path, rank: int, comm) -> list:
-    """Return this rank's committed logical chunks as in-memory arrays.
+def _iter_committed_logical_chunks(work_dir: Path, rank: int, comm):
+    """Yield this rank's committed logical chunks ONE AT A TIME (streaming).
 
-    Reads extents directly (no materialize-to-disk) for extent-backed gens, or
-    chunk files otherwise — so reading the committed state for norm/collect
-    never leaves stray chunk files behind (keeps the extent file-count win).
-    Must be called collectively (it uses the distributed gen resolver).
+    RAM-safe: only one chunk is resident at a time, so norm/collect never
+    materialize the whole per-rank partition in memory (that caused an
+    end-of-run OOM at large n).  Reads extents directly (no materialize-to-disk)
+    for extent-backed gens, or chunk files otherwise.  Collective (uses the
+    distributed gen resolver).
     """
     from wenbo_engine.recovery.rank_manifest import RankManifest
     from wenbo_engine.storage import extent_store
@@ -1433,31 +1557,52 @@ def _read_committed_logical_chunks(work_dir: Path, rank: int, comm) -> list:
     if RankManifest.exists(gdir):
         man = RankManifest.read(gdir)
         if any(c.is_extent for c in man.chunks):
-            from wenbo_engine.storage.extent_manifest import ExtentManifest
+            from wenbo_engine.storage.extent_manifest import (
+                ExtentManifest, ExtentChunkRecord,
+            )
             em = ExtentManifest(n_chunks=man.n_chunks, n_extents=0,
                                 chunk_size=man.chunk_size)
-            from wenbo_engine.storage.extent_manifest import ExtentChunkRecord
             for c in man.chunks:
                 em.records[c.index] = ExtentChunkRecord(
                     chunk_id=c.index, extent_id=c.extent_id,
                     offset=c.extent_offset, length=c.size_bytes,
                     checksum=c.checksum or "")
-            return [extent_store.read_logical_chunk(gdir, em, c.index)
-                    for c in sorted(man.chunks, key=lambda x: x.index)]
-    return [read_chunk(f) for f in sorted(chunks_dir.glob("chunk_*.bin"))]
+            for c in sorted(man.chunks, key=lambda x: x.index):
+                yield extent_store.read_logical_chunk(gdir, em, c.index)
+            return
+    for f in sorted(chunks_dir.glob("chunk_*.bin")):
+        yield read_chunk(f)
+
+
+def _read_committed_logical_chunks(work_dir: Path, rank: int, comm) -> list:
+    """All of this rank's committed logical chunks as a list (small states only).
+
+    Used by :func:`collect_state` (testing/verify on small n); materializes the
+    whole partition, so NOT used on the norm hot path — see
+    :func:`_iter_committed_logical_chunks` for the streaming variant.
+    """
+    return list(_iter_committed_logical_chunks(work_dir, rank, comm))
 
 
 def compute_norm(work_dir: str | Path,
                  comm: MPI.Comm | None = None) -> float:
-    """Compute global state-vector norm across all ranks (distributed)."""
+    """Compute global state-vector norm across all ranks (distributed).
+
+    Streams one chunk at a time and accumulates |amp|^2 with a float64
+    accumulator (no full-partition or complex128 upcast of the whole slice), so
+    peak RAM is ~one chunk + small temporaries.
+    """
     if comm is None:
         comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     work_dir = Path(work_dir)
 
     local_norm_sq = 0.0
-    for data in _read_committed_logical_chunks(work_dir, rank, comm):
-        local_norm_sq += float(np.sum(np.abs(data.astype(np.complex128)) ** 2))
+    for data in _iter_committed_logical_chunks(work_dir, rank, comm):
+        # |amp|^2 = re^2 + im^2, accumulated in float64; abs() on complex64
+        # yields float32 (half the bytes of a complex128 upcast).
+        local_norm_sq += float(np.sum(np.abs(data) ** 2, dtype=np.float64))
+        del data
 
     global_norm_sq = np.array(0.0)
     comm.Allreduce(np.array(local_norm_sq), global_norm_sq, op=MPI.SUM)

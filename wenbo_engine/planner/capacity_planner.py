@@ -93,6 +93,28 @@ MPI_BUFFER_FRACTION = 0.25
 # A streaming pipeline needs at least this much RAM to make progress.
 MIN_PIPELINE_RAM_GIB = 1.0
 
+# ── RAM working-set model (peak per-rank memory during a step/unit) ───────
+# When ``--ram-budget-gib`` is not given, the safe working budget is this
+# fraction of the node's RAM (the remainder covers OS + numba + headroom).
+DEFAULT_RAM_BUDGET_FRACTION = 0.70
+# Transient peak working memory ON TOP of the resident chunk, in multiples of
+# chunk bytes.  Calibrated to the 8-node cluster: processing one chunk through
+# the direct-read (raw bytes + np.frombuffer copy) -> 2-qubit gate apply (input
+# + output + einsum intermediate) -> writeback (tobytes copy) path transiently
+# holds ~3-4x the chunk.  An 8 GiB chunk OOM'd 30 GiB nodes (8*~4 = 32 GiB), so
+# 3.0 (total factor 1+3 = 4x) reproduces that and keeps auto-chunk-bits safe.
+NUMPY_TEMP_FACTOR = 3.0
+# Naive/gate-aware MPI holds a send + a recv buffer (2 chunks) in flight.
+SENDRECV_BUFFER_CHUNKS = 2
+# When the gate-aware remote-buffer cache is unbounded, model it as caching
+# this many remote chunks (one per partner across the rank-bit dimensions) —
+# the term that made mpi_nonlocal_heavy OOM at n=34.
+DEFAULT_REMOTE_CACHE_CHUNKS = 4
+# Fixed per-rank bookkeeping (manifests, plan, python objects).
+RAM_METADATA_GIB = 0.5
+# Multiplicative safety margin over the summed components.
+RAM_SAFETY_MARGIN = 1.2
+
 # Default ceiling for the feasibility search.  2^64 amplitudes is far beyond
 # any storage on Earth, so the search always terminates well below this.
 DEFAULT_MAX_CANDIDATE_QUBITS = 64
@@ -128,6 +150,16 @@ class PlannerConfig:
     durable_snapshots_retained: int | None = None
 
     allow_non_power_of_two: bool = False
+
+    # ── RAM working-set model inputs (all optional) ──────────────────────
+    chunk_bits: int | None = None               # None -> default_chunk_bits(n, ranks)
+    execution_mode: str = "compute_unit"        # worst-case path for the verdict
+    mpi_exchange_mode: str = "gate_aware"
+    ram_budget_gib: float | None = None         # None -> 70% of ram_per_rank_gib
+    max_overlay_chunks: int | None = None
+    max_remote_buffer_gib: float | None = None
+    auto_chunk_bits: bool = False               # bounded overlay + recommend chunk_bits
+    has_mpi: bool = True                         # workload-agnostic worst case
 
     def __post_init__(self) -> None:
         if self.precision not in BYTES_PER_AMP:
@@ -206,6 +238,22 @@ class PlannerConfig:
     def mpi_buffer_budget_bytes(self) -> float:
         return self.ram_buffer_budget_bytes * MPI_BUFFER_FRACTION
 
+    @property
+    def ram_working_budget_bytes(self) -> float:
+        """Per-rank RAM budget for the step/overlay working set.
+
+        Explicit ``ram_budget_gib`` if given, else
+        :data:`DEFAULT_RAM_BUDGET_FRACTION` of the node's RAM.  Zero only when
+        no RAM info is supplied (then the working-set check is skipped).
+        """
+        if self.ram_budget_gib is not None:
+            return self.ram_budget_gib * GIB
+        return self.ram_per_rank_gib * DEFAULT_RAM_BUDGET_FRACTION * GIB
+
+    @property
+    def max_remote_buffer_bytes(self) -> float | None:
+        return None if self.max_remote_buffer_gib is None else self.max_remote_buffer_gib * GIB
+
 
 # ── per-qubit-count feasibility report ───────────────────────────────────
 @dataclass
@@ -239,12 +287,25 @@ class QubitFeasibility:
     ram_buffer_budget_bytes: float
     mpi_buffer_budget_bytes: float
 
+    # ── RAM working-set model (per rank) ─────────────────────────────────
+    chunk_bits: int
+    chunk_bytes: float
+    estimated_peak_ram_bytes: float
+    ram_working_budget_bytes: float
+    recommended_chunk_bits: int | None
+    ram_components: dict = field(default_factory=dict)
+
     # verdicts
-    local_feasible: bool
-    ram_feasible: bool
-    durable_feasible: bool
-    feasible: bool
+    local_feasible: bool = False
+    ram_feasible: bool = False
+    durable_feasible: bool = False
+    feasible: bool = False
     reasons: list[str] = field(default_factory=list)
+
+    @property
+    def storage_feasible(self) -> bool:
+        """Alias: storage feasibility, reported separately from RAM."""
+        return self.local_feasible
 
     @property
     def total_local_required_bytes(self) -> float:
@@ -286,6 +347,110 @@ def _wal_metadata_overhead_bytes(per_rank_state: float, recovery_mode: str) -> f
         return 0.0
     chunks = max(per_rank_state / (128 * GIB / 1024), 1.0)
     return min(chunks * 256.0, 64 * GIB)
+
+
+def default_chunk_bits(num_qubits: int, num_ranks: int) -> int:
+    """The runner's default chunk_bits: leaves rank bits + 2 rank-nonlocal bits.
+
+    Mirrors ``communication_workloads._default_chunk_bits`` so the planner
+    models the same partition the runner would use by default.
+    """
+    p = num_ranks.bit_length() - 1 if num_ranks >= 1 else 0
+    k = num_qubits - p - 2
+    return max(1, min(k, num_qubits - p))
+
+
+def n_chunks_per_rank(num_qubits: int, chunk_bits: int, num_ranks: int) -> int:
+    return max(1, (1 << (num_qubits - chunk_bits)) // num_ranks)
+
+
+def estimate_peak_ram(*, num_qubits: int, num_ranks: int, chunk_bits: int,
+                      precision: str = "complex64",
+                      execution_mode: str = "compute_unit",
+                      mpi_exchange_mode: str = "gate_aware",
+                      bounded_overlay: bool = False,
+                      max_overlay_chunks: int | None = None,
+                      max_remote_buffer_bytes: float | None = None,
+                      has_mpi: bool = True) -> dict:
+    """Estimate peak per-rank RAM (bytes) for one step / compute unit.
+
+    ``peak_ram = (overlay/step working chunks + numpy temp + MPI sendrecv
+    buffers + remote-buffer cache + metadata) * safety_margin``.
+
+    ``bounded_overlay=False`` models the *current default* runtime, where a
+    compute-unit overlay holds the whole per-rank partition resident — this is
+    what OOM'd at n=36.  ``bounded_overlay=True`` models the RAM-aware path,
+    where the overlay streams at most ``max_overlay_chunks`` (default: as many
+    as fit the budget, but the estimate uses 1 resident + temp).
+    """
+    bpa = BYTES_PER_AMP[precision]
+    chunk_bytes = (1 << chunk_bits) * bpa
+    ncr = n_chunks_per_rank(num_qubits, chunk_bits, num_ranks)
+
+    if execution_mode == "compute_unit":
+        if bounded_overlay:
+            # bounded overlay STREAMS: it holds only as many chunks as the
+            # budget allows.  Default (no explicit cap) is the streaming
+            # minimum of 1 resident chunk (a local unit applies all its gates
+            # to a chunk, writes it, evicts, then loads the next).
+            cap = max_overlay_chunks if max_overlay_chunks else 1
+            resident = min(cap, ncr)
+        else:
+            resident = ncr                      # unbounded overlay = whole partition
+    else:                                       # step path streams one chunk
+        resident = 1
+    overlay_bytes = resident * chunk_bytes
+    numpy_temp = NUMPY_TEMP_FACTOR * chunk_bytes
+
+    sendrecv = SENDRECV_BUFFER_CHUNKS * chunk_bytes if has_mpi else 0
+    remote = 0.0
+    if has_mpi and mpi_exchange_mode == "gate_aware":
+        if max_remote_buffer_bytes is not None:
+            remote = max_remote_buffer_bytes
+        else:
+            remote = DEFAULT_REMOTE_CACHE_CHUNKS * chunk_bytes
+    meta = RAM_METADATA_GIB * GIB
+
+    components = {
+        "chunk_bytes": chunk_bytes,
+        "resident_chunks": resident,
+        "overlay_or_step_bytes": overlay_bytes,
+        "numpy_temp_bytes": numpy_temp,
+        "mpi_sendrecv_bytes": sendrecv,
+        "remote_buffer_cache_bytes": remote,
+        "metadata_bytes": meta,
+        "safety_margin": RAM_SAFETY_MARGIN,
+    }
+    peak = (overlay_bytes + numpy_temp + sendrecv + remote + meta) * RAM_SAFETY_MARGIN
+    components["estimated_peak_ram_bytes"] = peak
+    return components
+
+
+def recommend_chunk_bits(*, num_qubits: int, num_ranks: int,
+                         ram_budget_bytes: float, precision: str = "complex64",
+                         execution_mode: str = "compute_unit",
+                         mpi_exchange_mode: str = "gate_aware",
+                         max_overlay_chunks: int | None = None,
+                         max_remote_buffer_bytes: float | None = None,
+                         has_mpi: bool = True) -> int | None:
+    """Largest chunk_bits whose bounded-overlay peak RAM fits ``ram_budget_bytes``.
+
+    Searches valid chunk_bits (``1 .. num_qubits - p``) from largest down and
+    returns the first that fits.  ``None`` if even chunk_bits=1 does not fit
+    (the run is RAM-infeasible at this rank count).
+    """
+    p = num_ranks.bit_length() - 1 if num_ranks >= 1 else 0
+    hi = max(1, num_qubits - p)
+    for cb in range(hi, 0, -1):
+        est = estimate_peak_ram(
+            num_qubits=num_qubits, num_ranks=num_ranks, chunk_bits=cb,
+            precision=precision, execution_mode=execution_mode,
+            mpi_exchange_mode=mpi_exchange_mode, bounded_overlay=True,
+            max_overlay_chunks=max_overlay_chunks,
+            max_remote_buffer_bytes=max_remote_buffer_bytes, has_mpi=has_mpi)
+        if est["estimated_peak_ram_bytes"] <= ram_budget_bytes:
+            return cb
+    return None
 
 
 def evaluate_qubits(config: PlannerConfig, num_qubits: int) -> QubitFeasibility:
@@ -330,12 +495,69 @@ def evaluate_qubits(config: PlannerConfig, num_qubits: int) -> QubitFeasibility:
             f"local storage: need {total_local / TIB:.3f} TiB/rank, "
             f"have {usable_local / TIB:.3f} TiB/rank usable")
 
-    ram_feasible = ram_budget >= MIN_PIPELINE_RAM_GIB * GIB
-    if not ram_feasible:
-        reasons.append(
-            f"RAM: streaming pipeline needs >= {MIN_PIPELINE_RAM_GIB:.1f} GiB "
-            f"after a {RAM_OS_RESERVE_GIB:.0f} GiB OS reserve, "
-            f"have {ram_budget / GIB:.2f} GiB")
+    # ── RAM working-set model ────────────────────────────────────────────
+    ram_working_budget = config.ram_working_budget_bytes
+    recommended_cb = None
+    if ram_working_budget > 0:
+        recommended_cb = recommend_chunk_bits(
+            num_qubits=num_qubits, num_ranks=config.num_ranks,
+            ram_budget_bytes=ram_working_budget, precision=precision,
+            execution_mode=config.execution_mode,
+            mpi_exchange_mode=config.mpi_exchange_mode,
+            max_overlay_chunks=config.max_overlay_chunks,
+            max_remote_buffer_bytes=config.max_remote_buffer_bytes,
+            has_mpi=config.has_mpi)
+    # Effective chunk_bits: when auto-chunk-bits is on, the run WILL use the
+    # recommended chunk_bits with a bounded overlay, so the verdict is computed
+    # there.  Otherwise model the explicit/default chunk_bits and the current
+    # (unbounded overlay) behaviour.
+    default_cb = config.chunk_bits if config.chunk_bits is not None else \
+        default_chunk_bits(num_qubits, config.num_ranks)
+    if config.auto_chunk_bits and recommended_cb is not None:
+        cb = recommended_cb
+    else:
+        cb = default_cb
+    ram_comp = estimate_peak_ram(
+        num_qubits=num_qubits, num_ranks=config.num_ranks, chunk_bits=cb,
+        precision=precision, execution_mode=config.execution_mode,
+        mpi_exchange_mode=config.mpi_exchange_mode,
+        bounded_overlay=config.auto_chunk_bits,
+        max_overlay_chunks=config.max_overlay_chunks,
+        max_remote_buffer_bytes=config.max_remote_buffer_bytes,
+        has_mpi=config.has_mpi)
+    est_peak = ram_comp["estimated_peak_ram_bytes"]
+    chunk_bytes_val = ram_comp["chunk_bytes"]
+
+    # ``ram_feasible`` (the REPORTED field) always reflects the working-set
+    # model when RAM info is available; the legacy minimal-pipeline check is the
+    # fallback only when no RAM info at all is supplied.
+    legacy_pipeline_ok = ram_budget >= MIN_PIPELINE_RAM_GIB * GIB
+    if ram_working_budget <= 0:
+        ram_feasible = legacy_pipeline_ok
+        if not ram_feasible:
+            reasons.append(
+                f"RAM: streaming pipeline needs >= {MIN_PIPELINE_RAM_GIB:.1f} "
+                f"GiB after a {RAM_OS_RESERVE_GIB:.0f} GiB OS reserve, "
+                f"have {ram_budget / GIB:.2f} GiB")
+    else:
+        ram_feasible = est_peak <= ram_working_budget
+        if not ram_feasible:
+            msg = (f"RAM working set: estimated peak {est_peak / GIB:.2f} "
+                   f"GiB/rank (chunk_bits={cb}, {config.execution_mode}) "
+                   f"exceeds budget {ram_working_budget / GIB:.2f} GiB/rank")
+            if recommended_cb is not None and recommended_cb < cb:
+                msg += (f"; use --auto-chunk-bits (recommended chunk_bits="
+                        f"{recommended_cb})")
+            elif recommended_cb is None:
+                msg += "; not RAM-feasible at any chunk_bits for this rank count"
+            reasons.append(msg)
+    # The overall ``feasible`` verdict only ENFORCES the working-set RAM model
+    # when the user has engaged RAM-aware control (auto-chunk-bits or an
+    # explicit budget); otherwise it uses the legacy pipeline check so existing
+    # storage-frontier behaviour is unchanged.  ``ram_feasible`` is reported
+    # separately either way.
+    enforce_ram = config.auto_chunk_bits or config.ram_budget_gib is not None
+    verdict_ram = ram_feasible if enforce_ram else legacy_pipeline_ok
 
     if snapshots > 0 and durable_storage is not None:
         durable_feasible = durable_checkpoint_required <= durable_storage
@@ -346,7 +568,7 @@ def evaluate_qubits(config: PlannerConfig, num_qubits: int) -> QubitFeasibility:
     else:
         durable_feasible = True  # not required, or folded into local above
 
-    feasible = local_feasible and ram_feasible and durable_feasible
+    feasible = local_feasible and verdict_ram and durable_feasible
 
     return QubitFeasibility(
         num_qubits=num_qubits,
@@ -368,6 +590,12 @@ def evaluate_qubits(config: PlannerConfig, num_qubits: int) -> QubitFeasibility:
         durable_storage_bytes=durable_storage,
         ram_buffer_budget_bytes=ram_budget,
         mpi_buffer_budget_bytes=mpi_budget,
+        chunk_bits=cb,
+        chunk_bytes=chunk_bytes_val,
+        estimated_peak_ram_bytes=est_peak,
+        ram_working_budget_bytes=ram_working_budget,
+        recommended_chunk_bits=recommended_cb,
+        ram_components=ram_comp,
         local_feasible=local_feasible,
         ram_feasible=ram_feasible,
         durable_feasible=durable_feasible,
@@ -450,6 +678,14 @@ def _feasibility_dict(f: QubitFeasibility, num_ranks: int) -> dict:
         "durable_storage_available_tib": _tib(f.durable_storage_bytes),
         "ram_buffer_budget_per_rank_gib": _gib(f.ram_buffer_budget_bytes),
         "mpi_buffer_budget_per_rank_gib": _gib(f.mpi_buffer_budget_bytes),
+        # ── RAM working-set model ──
+        "chunk_bits": f.chunk_bits,
+        "chunk_bytes": f.chunk_bytes,
+        "estimated_peak_ram_gib": _gib(f.estimated_peak_ram_bytes),
+        "ram_budget_gib": _gib(f.ram_working_budget_bytes),
+        "recommended_chunk_bits": f.recommended_chunk_bits,
+        # ── verdicts (storage and RAM reported SEPARATELY) ──
+        "storage_feasible": f.storage_feasible,
         "local_feasible": f.local_feasible,
         "ram_feasible": f.ram_feasible,
         "durable_feasible": f.durable_feasible,
@@ -602,6 +838,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-non-power-of-two", action="store_true",
                    help="permit a non-power-of-two rank count (the MPI runner "
                         "requires a power of two)")
+    # ── RAM working-set model ──
+    p.add_argument("--chunk-bits", type=int, default=None,
+                   help="model RAM for this chunk_bits (default: the runner's "
+                        "default_chunk_bits for n/ranks)")
+    p.add_argument("--execution-mode", choices=["step", "compute_unit"],
+                   default="compute_unit",
+                   help="execution path to model for the RAM working set "
+                        "(default: compute_unit, the optimized overlay path)")
+    p.add_argument("--mpi-exchange-mode", choices=["naive", "gate_aware"],
+                   default="gate_aware")
+    p.add_argument("--ram-budget-gib", type=float, default=None,
+                   help="per-rank RAM budget for the working set "
+                        "(default: 70%% of --ram-per-rank-gib)")
+    p.add_argument("--max-overlay-chunks", type=int, default=None)
+    p.add_argument("--max-remote-buffer-gib", type=float, default=None)
+    p.add_argument("--auto-chunk-bits", action="store_true",
+                   help="model the RAM-aware bounded-overlay path and report the "
+                        "largest chunk_bits that fits the RAM budget")
+    p.add_argument("--no-mpi", dest="has_mpi", action="store_false", default=True,
+                   help="model a workload with no MPI-nonlocal gates (drops MPI "
+                        "send/recv + remote-cache RAM terms)")
     return p
 
 
@@ -622,6 +879,14 @@ def main(argv: list[str] | None = None) -> int:
             needs_destination_generation=args.needs_destination_generation,
             durable_snapshots_retained=args.durable_snapshots_retained,
             allow_non_power_of_two=args.allow_non_power_of_two,
+            chunk_bits=args.chunk_bits,
+            execution_mode=args.execution_mode,
+            mpi_exchange_mode=args.mpi_exchange_mode,
+            ram_budget_gib=args.ram_budget_gib,
+            max_overlay_chunks=args.max_overlay_chunks,
+            max_remote_buffer_gib=args.max_remote_buffer_gib,
+            auto_chunk_bits=args.auto_chunk_bits,
+            has_mpi=args.has_mpi,
         )
     except ValueError as e:
         print(json.dumps({"error": str(e)}, indent=2))

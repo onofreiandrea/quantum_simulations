@@ -272,3 +272,30 @@ def test_mixed_staged_uses_fallback_not_tiny_units(tmp_path):
     assert abs(c["final_norm"] - 1.0) < 1e-5
     assert c.get("compute_unit_fallbacks", 0) >= 1   # fallback engaged
     assert c.get("execution_mode") == "compute_unit"
+
+
+# ── RAM-aware: bounded overlay streams (budget) yet stays correct ────────
+
+def test_compute_unit_bounded_overlay_correct_and_low_peak(tmp_path):
+    from wenbo_engine.runtime.compute_unit import ComputeUnit, execute_local_unit
+    n_chunks, cs = 8, 8
+    rng = np.random.default_rng(3)
+    src = tmp_path / "g0" / "chunks"; src.mkdir(parents=True)
+    base = {}
+    for c in range(n_chunks):
+        a = (rng.standard_normal(cs) + 1j * rng.standard_normal(cs)).astype(DTYPE)
+        base[c] = a.copy()
+        write_chunk_atomic(src / chunk_filename(c), a)
+    H = gmod.gate_matrix("H", {}).astype(DTYPE)
+    ops = [([0], H), ([1], H)]
+    # ram_budget_chunks=1 forces the overlay to stream one chunk at a time
+    unit = ComputeUnit(compute_unit_id=0, kind="local", src_generation=0,
+                       dst_generation=1, rank=0, chunk_ids=list(range(n_chunks)),
+                       local_ops=ops, ram_budget_chunks=1)
+    ov = execute_local_unit(unit, src, tmp_path / "g1" / "chunks", _apply_local_ops)
+    # peak resident bounded to ~1 chunk despite 8 chunks total
+    assert ov.peak_resident_bytes <= 2 * base[0].nbytes
+    for c in range(n_chunks):
+        expect = base[c].copy(); _apply_local_ops(expect, ops)
+        got = read_chunk(tmp_path / "g1" / "chunks" / chunk_filename(c))
+        assert np.allclose(got, expect, atol=1e-6)

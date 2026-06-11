@@ -193,3 +193,21 @@ def test_mixed_staged_keeps_all_phases(tmp_path):
     assert s["measured_local_ops"] > 0
     assert s["measured_rank_nonlocal_ops"] > 0
     assert s["measured_mpi_nonlocal_ops"] > 0
+
+
+# ── RAM-aware: remote buffer cache stays correct under a byte budget ─────
+
+def test_remote_buffer_cache_correct_under_budget():
+    import numpy as np
+    from wenbo_engine.mpi.remote_buffer_cache import RemoteBufferCache
+    from wenbo_engine.storage.block_store import DTYPE
+    a = np.arange(256, dtype=DTYPE)
+    b = (np.arange(256, dtype=DTYPE) + 1000)
+    cache = RemoteBufferCache(max_bytes=2 * a.nbytes)   # holds ~2 chunks
+    cache.put(1, 0, a.copy())
+    cache.put(1, 1, b.copy())
+    assert np.array_equal(cache.get(1, 0), a)           # still cached
+    assert np.array_equal(cache.get(1, 1), b)
+    cache.put(2, 0, a.copy())                            # exceeds -> LRU evict
+    assert cache.evictions >= 1
+    assert cache._bytes <= cache.max_bytes
