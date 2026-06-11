@@ -72,6 +72,38 @@ def plan_to_json(plan, *, indent: int | None = 2) -> str:
     return json.dumps(serialize_plan(plan), sort_keys=True, indent=indent)
 
 
+# ── recovery-aware planner v1 ───────────────────────────────────────────
+#
+# The recovery-aware planner already returns JSON-safe dicts (lists/dicts of
+# primitives), so serialization is the identity plus a stable JSON encoding.
+# These helpers give callers one place to produce the three artifact files.
+
+def serialize_recovery_aware_plan(plan: dict) -> dict:
+    """plan.json content: hardware + context + decision + per-stage plan."""
+    return {
+        "schema_version": _SCHEMA_VERSION,
+        "planner": plan.get("planner", "recovery_aware_v1"),
+        "hardware": plan.get("hardware", {}),
+        "context_summary": plan.get("context_summary", {}),
+        "decision": plan.get("decision", {}),
+        "stage_plans": plan.get("stage_plans", []),
+    }
+
+
+def serialize_candidate_strategies(plan: dict) -> dict:
+    """candidate_strategies.json content: every candidate + its estimate."""
+    return {
+        "planner": plan.get("planner", "recovery_aware_v1"),
+        "selected_strategy": plan.get("decision", {}).get("selected_strategy"),
+        "candidates": plan.get("candidates", []),
+    }
+
+
+def recovery_aware_plan_to_json(plan: dict, *, indent: int | None = 2) -> str:
+    return json.dumps(serialize_recovery_aware_plan(plan), indent=indent,
+                      default=str)
+
+
 def deserialize_plan(data: dict):
     """Rebuild a :class:`~.optimizer_v2.Plan` from a serialized dict."""
     from wenbo_engine.planner.optimizer_v2 import Plan, Stage, HardwareConfig
