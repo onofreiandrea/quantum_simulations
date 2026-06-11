@@ -185,6 +185,7 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
         cfg.storage_layout = _rp["storage_layout"]
         cfg.execution_mode = _rp["execution_mode"]
         cfg.extent_io_mode = _rp["extent_io_mode"]
+        cfg.mpi_exchange_mode = _rp["mpi_exchange_mode"]
         cfg.compute_unit_min_gates = _rp["compute_unit_min_gates"]
 
     run_id = _make_run_id(cfg, circuit)
@@ -403,6 +404,7 @@ def _run_mpi(cfg, circuit, work_dir, chunk_size, run_dir, comm, n_ranks, rank):
     mpi_runner.run(circuit, work_dir, chunk_size=chunk_size,
                    comm=comm, buffer_depth=cfg.buffer_depth,
                    recovery=mode,
+                   mpi_exchange_mode=getattr(cfg, "mpi_exchange_mode", "naive"),
                    storage_layout=getattr(cfg, "storage_layout", "chunks"),
                    execution_mode=getattr(cfg, "execution_mode", "step"),
                    compute_unit_min_gates=getattr(cfg, "compute_unit_min_gates", 4),
@@ -595,6 +597,11 @@ def main(argv=None) -> int:
                          "round-trip through temp chunk files) or direct (read/"
                          "write logical chunks straight from/to extent slices, "
                          "no temp chunk files).")
+    ap.add_argument("--mpi-exchange-mode", dest="mpi_exchange_mode",
+                    choices=["naive", "gate_aware"], default="naive",
+                    help="MPI-nonlocal exchange path: naive (one Sendrecv per "
+                         "chunk per gate) or gate_aware (batch per-partner + "
+                         "reuse received remote chunks).")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -611,6 +618,7 @@ def main(argv=None) -> int:
     cfg.execution_mode = args.execution_mode
     cfg.compute_unit_min_gates = args.compute_unit_min_gates
     cfg.extent_io_mode = args.extent_io_mode
+    cfg.mpi_exchange_mode = args.mpi_exchange_mode
     cfg.validate()
 
     run_dir = run_experiment(cfg, run_id=args.run_id)

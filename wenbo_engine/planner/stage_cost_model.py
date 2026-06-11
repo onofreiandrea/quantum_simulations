@@ -56,6 +56,10 @@ DEFAULT_COST_MODEL: dict = {
     # so optimizer-v2's stage_cost is unaffected).  Small but non-zero so the
     # term is represented; smaller committed generations ⇒ less work at risk.
     "planner_failure_prob": 0.01,
+    # Per-Sendrecv call latency (recovery-aware planner only).  Lets the cost
+    # model reward gate_aware's call-count reduction even when the bytes moved
+    # are unchanged — fewer blocking Sendrecv round trips is cheaper.
+    "mpi_sendrecv_latency_ms": 0.05,
 }
 
 # Flat cost-model keys we read; everything else in a calibration file is
@@ -64,6 +68,7 @@ _REQUIRED_KEYS = (
     "nvme_read_gbps", "nvme_write_gbps", "fsync_ms", "rename_ms",
     "mpi_sendrecv_gbps", "mpi_barrier_ms", "kernel_gbps", "failure_prob",
     "durable_write_gbps", "direct_extent_seek_ms", "planner_failure_prob",
+    "mpi_sendrecv_latency_ms",
 )
 
 _GB = 1e9
@@ -196,6 +201,8 @@ def recovery_aware_cost(*, bytes_read: int, bytes_written: int,
     mpi = _mpi_sec(mpi_bytes, model)
     if mpi_bytes or sendrecv_count:
         mpi += model["mpi_barrier_ms"] * _MS
+    # per-call Sendrecv latency: rewards gate_aware's batched (fewer) calls
+    mpi += sendrecv_count * model.get("mpi_sendrecv_latency_ms", 0.0) * _MS
     kernel = kernel_bytes / (model["kernel_gbps"] * _GB) if kernel_bytes else 0.0
 
     avg = _nvme_rw_avg_gbps(model)

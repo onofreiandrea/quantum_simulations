@@ -979,11 +979,27 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
     # metrics against the measured run, and attach the decision + cost report.
     if recovery_aware_plan is not None:
         from wenbo_engine.planner import build_cost_report
+        # Byte metrics at a CONSISTENT cluster aggregation level.  The
+        # instrumented agg.bytes_* are summed across all ranks (true cluster
+        # total) for the step / materialize paths.  The direct extent path is
+        # not chunk-file-instrumented, so agg.bytes_* is 0 there; fall back to
+        # the rank-0 overlay bytes scaled by num_ranks (partitions are
+        # homogeneous), and expose the per-rank value too — never compare a
+        # cluster prediction against a rank-0 actual unlabelled.
+        _ov_r0_read = int(overlay_metrics.get("overlay_bytes_read") or 0)
+        _ov_r0_written = int(overlay_metrics.get("overlay_bytes_written") or 0)
+        if aggregate["bytes_read"] > 0:
+            cl_read = aggregate["bytes_read"]
+            cl_written = aggregate["bytes_written"]
+        else:
+            cl_read = _ov_r0_read * num_ranks
+            cl_written = _ov_r0_written * num_ranks
         actual = {
-            "bytes_read": (overlay_metrics.get("overlay_bytes_read")
-                           or aggregate["bytes_read"]),
-            "bytes_written": (overlay_metrics.get("overlay_bytes_written")
-                              or aggregate["bytes_written"]),
+            "bytes_read_cluster": cl_read,
+            "bytes_written_cluster": cl_written,
+            "bytes_read_per_rank": cl_read // num_ranks if num_ranks else cl_read,
+            "bytes_written_per_rank": (cl_written // num_ranks
+                                       if num_ranks else cl_written),
             "read_ops": aggregate["read_ops"],
             "write_ops": aggregate["write_ops"],
             "temporary_chunk_files_created": aggregate["write_ops"],
@@ -991,6 +1007,7 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
             "sendrecv_count": aggregate["sendrecv_count"],
             "kernel_time": aggregate["kernel_time"],
             "commit_count": _count_commit_records(work_dir),
+            "num_ranks": num_ranks,
             "wall_time": aggregate["stage_time"],
             "work_time": (aggregate["read_sec"] + aggregate["write_sec"]
                           + aggregate["kernel_time"]

@@ -29,6 +29,7 @@ from wenbo_engine.planner.stage_cost_model import (
 from wenbo_engine.planner.stage_plan import StagePlan
 from wenbo_engine.planner.strategy_candidate import (
     StrategyCandidate, PlanContext, enumerate_candidates, estimate_candidate,
+    estimate_mpi_exchange,
 )
 from wenbo_engine.planner.strategy_selector import select_strategy
 
@@ -115,6 +116,10 @@ def build_plan_context(circuit_dict: dict, *, n: int, chunk_bits: int,
     chunk_bytes = (1 << k) * np.dtype(DTYPE).itemsize
 
     steps = _compile_steps(levelize(circuit_dict), k, n_local_bits)
+    # deterministic per-mode MPI estimate from the real exchange planner
+    mpi_estimates = estimate_mpi_exchange(
+        steps, num_ranks=num_ranks, k=k, n_local_bits=n_local_bits,
+        n_chunks_per_rank=n_chunks_per_rank, chunk_bytes=chunk_bytes)
     step_descs = _build_step_descriptors(steps)
     unit_descs, fallbacks = _build_unit_descriptors(
         steps, n_chunks_per_rank=n_chunks_per_rank,
@@ -134,6 +139,7 @@ def build_plan_context(circuit_dict: dict, *, n: int, chunk_bits: int,
         max_local_run_gates=max_run,
         has_fused_local_unit=(max_run >= compute_unit_min_gates),
         n_compute_unit_fallbacks=fallbacks,
+        mpi_estimates=mpi_estimates,
     )
 
 
@@ -143,6 +149,12 @@ def _stage_plans_for(selected: StrategyCandidate, ctx: PlanContext
     passes = (ctx.units if selected.execution_mode == "compute_unit"
               else ctx.steps)
     C, B, R = ctx.n_chunks_per_rank, ctx.chunk_bytes, ctx.num_ranks
+    # deterministic MPI total for the selected mode, attributed per stage in
+    # proportion to each stage's share of MPI-nonlocal gates.
+    mpi_est = (ctx.mpi_estimates or {}).get(selected.mpi_exchange_mode,
+                                            {"sendrecv_count": 0,
+                                             "mpi_bytes_sent": 0})
+    total_mnl = sum(d["mpi_nl"] for d in passes) or 1
     plans: list[StagePlan] = []
     for d in passes:
         is_local = d["rank_nl"] == 0 and d["mpi_nl"] == 0
@@ -151,14 +163,12 @@ def _stage_plans_for(selected: StrategyCandidate, ctx: PlanContext
         extent_mat = (2 * C * B * R if (selected.storage_layout == "extents"
                       and not direct_local) else 0)
         direct_chunks = C * R if direct_local else 0
-        mnl = d["mpi_nl"]
-        sc = mnl * C * R
-        if selected.mpi_exchange_mode == "gate_aware" and sc:
-            from wenbo_engine.planner.strategy_candidate import GATE_AWARE_REUSE
-            sc = max(1, round(sc * GATE_AWARE_REUSE))
+        frac = d["mpi_nl"] / total_mnl if d["mpi_nl"] else 0.0
+        sc = round(mpi_est["sendrecv_count"] * frac)
+        mpi_bytes_stage = round(mpi_est["mpi_bytes_sent"] * frac)
         cost = recovery_aware_cost(
             bytes_read=C * B * R, bytes_written=C * B * R,
-            mpi_bytes=sc * B, sendrecv_count=sc,
+            mpi_bytes=mpi_bytes_stage, sendrecv_count=sc,
             kernel_bytes=d["gates"] * C * B * R, commits=1,
             extent_materialize_bytes=extent_mat,
             direct_extent_chunks=direct_chunks,
@@ -179,7 +189,7 @@ def _stage_plans_for(selected: StrategyCandidate, ctx: PlanContext
             durable_policy="none",
             estimated_nvme_read_bytes=C * B * R,
             estimated_nvme_write_bytes=C * B * R,
-            estimated_mpi_bytes=sc * B,
+            estimated_mpi_bytes=mpi_bytes_stage,
             estimated_sendrecv_count=sc,
             estimated_kernel_time=cost["kernel_cost"],
             estimated_layout_materialization_cost=cost["layout_materialization_cost"],

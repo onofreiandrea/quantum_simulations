@@ -48,21 +48,54 @@ def _plan(kind, n=24, depth=20, ranks=4, recovery="generation", min_gates=4):
 
 def test_candidates_generated():
     cands = enumerate_candidates()
-    assert len(cands) == 4
     names = [c.name for c in cands]
     assert names == [
         "chunks+step+naive",
+        "chunks+step+gate_aware",
         "extents+step+gate_aware",
         "extents+compute_unit+materialize+gate_aware",
         "extents+compute_unit+direct+gate_aware",
     ]
 
 
+def test_chunks_step_gate_aware_candidate_exists():
+    names = {c.name for c in enumerate_candidates()}
+    assert "chunks+step+gate_aware" in names
+    c = next(c for c in enumerate_candidates() if c.name == "chunks+step+gate_aware")
+    assert c.storage_layout == "chunks" and c.execution_mode == "step"
+    assert c.mpi_exchange_mode == "gate_aware"
+
+
+def test_mpi_heavy_can_select_chunks_step_gate_aware():
+    """MPI-heavy is no longer forced into extents: chunks+step+gate_aware wins
+    when it is cheaper than the extent-based gate_aware candidate."""
+    plan = _plan("mpi_nonlocal_heavy")
+    sel = plan["decision"]["selected_strategy"]
+    assert sel["name"] == "chunks+step+gate_aware"
+    assert sel["storage_layout"] == "chunks"
+    assert sel["mpi_exchange_mode"] == "gate_aware"
+    by = {c["candidate"]: c["estimated_total_cost"] for c in plan["candidates"]}
+    assert by["chunks+step+gate_aware"] < by["extents+step+gate_aware"]
+
+
+def test_mpi_estimate_is_deterministic_not_heuristic():
+    """MPI bytes / sendrecv come from the real exchange planner."""
+    plan = _plan("mpi_nonlocal_heavy")
+    for c in plan["candidates"]:
+        assert c["mpi_estimate_method"] == "exchange_planner"
+    # gate_aware predicts fewer Sendrecv calls than naive for the same bytes
+    ga = next(c for c in plan["candidates"]
+              if c["candidate"] == "extents+step+gate_aware")
+    nv = next(c for c in plan["candidates"] if c["candidate"] == "chunks+step+naive")
+    assert ga["sendrecv_count"] < nv["sendrecv_count"]
+    assert ga["mpi_bytes_sent"] == nv["mpi_bytes_sent"]   # same data, fewer calls
+
+
 # ── 2. candidate costs contain all required terms ───────────────────────
 
 def test_candidate_costs_have_all_terms():
     plan = _plan("communication_light")
-    assert len(plan["candidates"]) == 4
+    assert len(plan["candidates"]) == 5
     for c in plan["candidates"]:
         for term in _REQUIRED_TERMS:
             assert term in c, (c["candidate"], term)
@@ -176,15 +209,71 @@ def test_reason_explains_rejected_cheaper_candidate():
 def test_cost_report_records_predicted_and_actual():
     plan = _plan("communication_light")
     # synthesize an "actual" measurement and build the report
-    actual = {"bytes_read": 100, "bytes_written": 100, "read_ops": 0,
-              "write_ops": 0, "temporary_chunk_files_created": 0,
+    actual = {"bytes_read_cluster": 100, "bytes_written_cluster": 100,
+              "bytes_read_per_rank": 25, "bytes_written_per_rank": 25,
+              "read_ops": 0, "write_ops": 0, "temporary_chunk_files_created": 0,
               "mpi_bytes_sent": 0, "sendrecv_count": 0, "kernel_time": 0.01,
-              "commit_count": 2, "wall_time": 1.0, "work_time": 0.5}
+              "commit_count": 2, "num_ranks": 4, "wall_time": 1.0,
+              "work_time": 0.5}
     rep = build_cost_report(plan, actual)
     for key in ("read_ops", "mpi_bytes_sent", "commit_count"):
         m = rep["metrics"][key]
         assert "predicted" in m and "actual" in m
         assert m["prediction_error_pct"] is not None   # 15. error computed
+
+
+def test_cost_report_byte_metrics_same_aggregation():
+    """Byte error is computed cluster-to-cluster, with both levels labelled."""
+    plan = _plan("communication_light")
+    actual = {"bytes_read_cluster": 128, "bytes_written_cluster": 128,
+              "bytes_read_per_rank": 32, "bytes_written_per_rank": 32,
+              "num_ranks": 4, "read_ops": 0, "write_ops": 0,
+              "temporary_chunk_files_created": 0, "mpi_bytes_sent": 0,
+              "sendrecv_count": 0, "kernel_time": 0.0, "commit_count": 2}
+    rep = build_cost_report(plan, actual)
+    br = rep["metrics"]["bytes_read"]
+    for f in ("predicted_cluster", "actual_cluster", "predicted_per_rank",
+              "actual_per_rank", "aggregation_compared", "prediction_error_pct"):
+        assert f in br
+    assert br["aggregation_compared"] == "cluster"
+    assert br["actual_cluster"] == 128
+    # error compares cluster predicted to cluster actual (not rank-0)
+    assert br["prediction_error_pct"] == _expected_err(
+        br["predicted_cluster"], 128)
+
+
+def _expected_err(pred, act):
+    denom = abs(pred) if abs(pred) > 1e-12 else 1.0
+    return round((act - pred) / denom * 100.0, 2)
+
+
+def test_cost_report_labels_mpi_method():
+    plan = _plan("mpi_nonlocal_heavy")
+    rep = build_cost_report(plan, {})
+    assert rep["mpi_estimate_method"] == "exchange_planner"
+    assert rep["mpi_estimate_is_heuristic"] is False
+
+
+def test_cost_report_actual_metrics_available_flag():
+    plan = _plan("communication_light")
+    # no measured metrics → honest predicted-only report
+    rep_empty = build_cost_report(plan, {})
+    assert rep_empty["actual_metrics_available"] is False
+    # with measured metrics → available
+    rep_full = build_cost_report(plan, {"read_ops": 1, "num_ranks": 4})
+    assert rep_full["actual_metrics_available"] is True
+
+
+def test_run_experiment_wires_mpi_exchange_mode():
+    """run_experiment exposes --mpi-exchange-mode and passes it to the runner;
+    selected_run_params carries the exchange mode the planner picks."""
+    import inspect
+    from wenbo_engine.experiments import run_experiment as re
+    src = inspect.getsource(re._run_mpi)
+    assert "mpi_exchange_mode=getattr(cfg" in src
+    # the planner exposes the exchange mode so run_experiment can wire it
+    plan = _plan("mpi_nonlocal_heavy")
+    assert "mpi_exchange_mode" in selected_run_params(plan)
 
 
 # ── real-MPI smokes (cover artifacts + invariants + correctness) ────────
