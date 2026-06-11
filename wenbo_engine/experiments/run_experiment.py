@@ -358,6 +358,33 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
                 recovery_aware_plan["ram"].get("recommended_chunk_bits")
         _extra["auto_chunk_bits_enabled"] = bool(getattr(cfg, "auto_chunk_bits", False))
         _extra["ram_budget_gib"] = getattr(cfg, "ram_budget_gib", None)
+        # MPI-window feasibility analysis (analysis-only, OFF by default).
+        _wa_mode = getattr(cfg, "mpi_window_analysis", "off")
+        _extra["mpi_window_analysis"] = _wa_mode
+        if _wa_mode == "report" and cfg.runner == "mpi":
+            import math as _m2
+            from wenbo_engine.planner.mpi_window_report import (
+                build_window_report, report_to_candidates_json,
+                report_to_summary_json,
+            )
+            _mt = {}
+            try:
+                _mt = json.loads((work_dir / "mpi_telemetry.json").read_text())
+            except (OSError, ValueError):
+                _mt = {}
+            _rep = build_window_report(
+                circuit, int(_m2.log2(chunk_size)), n_ranks,
+                ram_budget_gib=getattr(cfg, "ram_budget_gib", None),
+                mpi_telemetry=_mt)
+            (run_dir / "mpi_window_candidates.json").write_text(
+                json.dumps(report_to_candidates_json(_rep), indent=2))
+            (run_dir / "mpi_window_report.json").write_text(
+                json.dumps(report_to_summary_json(_rep), indent=2))
+            _extra["mpi_window_num_candidates"] = _rep["num_candidate_windows"]
+            _extra["mpi_window_num_feasible"] = _rep["num_feasible_windows"]
+            _extra["mpi_window_executor_worth_implementing"] = \
+                _rep["executor_worth_implementing"]
+            _extra["mpi_window_recommendation"] = _rep["recommendation"]
         try:
             _kmj = json.loads((work_dir / "kernel_metrics.json").read_text())
             for _kk in ("kernel_backend_requested","kernel_backend_used","kernel_backend_available","numba_compile_time","backend_fallback_reason"):
@@ -666,6 +693,10 @@ def main(argv=None) -> int:
     ap.add_argument("--kernel-backend", dest="kernel_backend",
                     choices=["numpy", "numba", "auto"], default="auto",
                     help="CPU kernel backend: numpy|numba|auto (safe fallback).")
+    ap.add_argument("--mpi-window-analysis", dest="mpi_window_analysis",
+                    choices=["off", "report"], default="off",
+                    help="analysis-only MPI window feasibility report "
+                         "(off|report); never changes execution.")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -688,6 +719,7 @@ def main(argv=None) -> int:
     cfg.max_overlay_chunks = args.max_overlay_chunks
     cfg.max_remote_buffer_gib = args.max_remote_buffer_gib
     cfg.kernel_backend = args.kernel_backend
+    cfg.mpi_window_analysis = args.mpi_window_analysis
     cfg.validate()
 
     run_dir = run_experiment(cfg, run_id=args.run_id)

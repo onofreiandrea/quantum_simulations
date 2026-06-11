@@ -886,7 +886,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                  auto_chunk_bits: bool = False,
                  max_overlay_chunks: int | None = None,
                  max_remote_buffer_gib: float | None = None,
-                 kernel_backend: str = "auto") -> dict:
+                 kernel_backend: str = "auto",
+                 mpi_window_analysis: str = "off") -> dict:
     """Run a communication workload under instrumentation.
 
     Builds the circuit, optionally applies production reordering
@@ -1212,6 +1213,21 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
             "actual_cost_after_run": actual,
             "cost_report": cost_report,
         }
+
+    # MPI-window feasibility analysis (rank 0, pure, post-run).  OFF by
+    # default; never touches execution / recovery / remote cache.  Reads the
+    # measured telemetry only to report the true baseline alongside the
+    # analytic prediction.
+    if mpi_window_analysis == "report":
+        from wenbo_engine.planner.mpi_window_report import build_window_report
+        result["mpi_window_analysis"] = build_window_report(
+            cd, chunk_bits, num_ranks,
+            ram_budget_gib=ram_budget_resolved,
+            measured={"sendrecv_count": aggregate["sendrecv_count"],
+                      "mpi_bytes_sent": aggregate["mpi_bytes_sent"]},
+            mpi_telemetry=mpi_telemetry)
+    else:
+        result["mpi_window_analysis"] = {"analysis_mode": "off"}
 
     if output_dir is not None:
         write_artifacts(output_dir, result, cd, work_dir=work_dir)
@@ -1601,6 +1617,30 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
                 "requires_remote_amplitudes_applications"):
         required[_kk] = _mt.get(_kk)
 
+    # ── MPI-window feasibility analysis (analysis-only; OFF by default) ──
+    _wa = result.get("mpi_window_analysis") or {"analysis_mode": "off"}
+    required["mpi_window_analysis"] = _wa.get("analysis_mode", "off")
+    if _wa.get("analysis_mode") == "report":
+        from wenbo_engine.planner.mpi_window_report import (
+            report_to_candidates_json, report_to_summary_json,
+        )
+        (d / "mpi_window_candidates.json").write_text(
+            json.dumps(report_to_candidates_json(_wa), indent=2))
+        (d / "mpi_window_report.json").write_text(
+            json.dumps(report_to_summary_json(_wa), indent=2))
+        _to = _wa.get("tradeoffs", {})
+        required["mpi_window_num_candidates"] = _wa.get("num_candidate_windows")
+        required["mpi_window_num_feasible"] = _wa.get("num_feasible_windows")
+        required["mpi_window_bytes_saved"] = _to.get("bytes_saved")
+        required["mpi_window_sendrecv_saved"] = _to.get("sendrecv_calls_saved")
+        required["mpi_window_commits_saved"] = _to.get("commits_saved")
+        required["mpi_window_extra_ram_gib"] = _to.get("extra_ram_gib_required")
+        required["mpi_window_extra_recomputation_cost"] = \
+            _to.get("extra_recomputation_cost_after_crash")
+        required["mpi_window_executor_worth_implementing"] = \
+            _wa.get("executor_worth_implementing")
+        required["mpi_window_recommendation"] = _wa.get("recommendation")
+
     if "correct" in result:
         required["correct"] = result["correct"]
     try:
@@ -1716,6 +1756,11 @@ def main(argv: list[str] | None = None) -> None:
                     type=float, default=None,
                     help="cap the gate-aware remote-buffer cache (GiB/rank); "
                          "default: 25%% of the RAM budget.")
+    ap.add_argument("--mpi-window-analysis", dest="mpi_window_analysis",
+                    choices=["off", "report"], default="off",
+                    help="analyze (do not execute) multi-step MPI exchange "
+                         "windows: 'report' writes mpi_window_candidates.json + "
+                         "mpi_window_report.json; 'off' (default) does nothing")
     ap.add_argument("--kernel-backend", dest="kernel_backend",
                     choices=["numpy", "numba", "auto"], default="auto",
                     help="CPU kernel numerical backend: numpy (baseline) | numba "
@@ -1787,6 +1832,7 @@ def main(argv: list[str] | None = None) -> None:
         max_remote_buffer_gib=args.max_remote_buffer_gib,
         extent_io_mode=args.extent_io_mode,
         kernel_backend=args.kernel_backend,
+        mpi_window_analysis=args.mpi_window_analysis,
     )
 
     if rank == 0:

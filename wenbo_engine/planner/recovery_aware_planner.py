@@ -311,3 +311,23 @@ def selected_run_params(plan: dict) -> dict:
         "mpi_exchange_mode": s["mpi_exchange_mode"],
         "compute_unit_min_gates": s["compute_unit_min_gates"],
     }
+
+
+def attach_window_feasibility(plan: dict, circuit_dict: dict, *,
+                              chunk_bits: int, num_ranks: int,
+                              ram_budget_gib: float | None = None) -> dict:
+    """Annotate a recovery-aware plan with an MPI-window feasibility summary.
+
+    Analysis-only and **opt-in**: this is never called by
+    :func:`plan_recovery_aware` and never changes strategy selection or runtime
+    behavior.  It returns ``plan`` with an added ``"mpi_window_feasibility"``
+    key (the report summary, candidates omitted) so callers that already hold a
+    plan can surface the window prediction without a separate entry point.
+    """
+    from wenbo_engine.planner.mpi_window_report import (
+        build_window_report, report_to_summary_json,
+    )
+    rep = build_window_report(circuit_dict, chunk_bits, num_ranks,
+                              ram_budget_gib=ram_budget_gib)
+    plan["mpi_window_feasibility"] = report_to_summary_json(rep)
+    return plan
