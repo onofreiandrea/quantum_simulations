@@ -887,7 +887,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                  max_overlay_chunks: int | None = None,
                  max_remote_buffer_gib: float | None = None,
                  kernel_backend: str = "auto",
-                 mpi_window_analysis: str = "off") -> dict:
+                 mpi_window_analysis: str = "off",
+                 mpi_window_execution: str = "off") -> dict:
     """Run a communication workload under instrumentation.
 
     Builds the circuit, optionally applies production reordering
@@ -1019,7 +1020,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                 max_overlay_chunks=max_overlay_chunks,
                 max_remote_buffer_gib=max_remote_buffer_gib,
                 auto_chunk_bits=auto_chunk_bits,
-                kernel_backend=kernel_backend)
+                kernel_backend=kernel_backend,
+                mpi_window_execution=mpi_window_execution)
         elif recovery == "generation":
             raise RuntimeError(
                 "recovery='generation' requires the generation-recovery "
@@ -1058,6 +1060,15 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
             mpi_telemetry = json.loads(mt_path.read_text())
         except (OSError, ValueError):
             mpi_telemetry = {}
+
+    # MPI true-mixing window-executor metrics (written by run() when enabled).
+    mpi_window_exec = {}
+    we_path = Path(work_dir) / "mpi_window_exec.json"
+    if we_path.exists():
+        try:
+            mpi_window_exec = json.loads(we_path.read_text())
+        except (OSError, ValueError):
+            mpi_window_exec = {}
 
     ram_metrics = {}
     rm_path = Path(work_dir) / "ram_metrics.json"
@@ -1130,6 +1141,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         "ram_metrics": ram_metrics,
         "kernel_metrics": kernel_metrics,
         "mpi_telemetry": mpi_telemetry,
+        "mpi_window_exec": mpi_window_exec,
+        "mpi_window_execution_mode": mpi_window_execution,
         "mpi_gate_classes": mpi_gate_classes,
         "kernel_backend_requested": kernel_backend,
         "auto_chunk_bits_enabled": bool(auto_chunk_bits),
@@ -1641,6 +1654,26 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
             _wa.get("executor_worth_implementing")
         required["mpi_window_recommendation"] = _wa.get("recommendation")
 
+    # ── MPI true-mixing window executor metrics (off by default) ──
+    _we = result.get("mpi_window_exec") or {}
+    required["mpi_window_execution_mode"] = _we.get(
+        "mpi_window_execution_mode",
+        result.get("mpi_window_execution_mode", "off"))
+    required["mpi_windows_executed"] = _we.get("mpi_windows_executed", 0)
+    required["mpi_window_steps_executed"] = _we.get("mpi_window_steps_executed", 0)
+    required["mpi_window_gates_executed"] = _we.get("mpi_window_gates_executed", 0)
+    required["mpi_window_gather_bytes"] = _we.get("mpi_window_gather_bytes", 0)
+    required["mpi_window_scatter_bytes"] = _we.get("mpi_window_scatter_bytes", 0)
+    required["mpi_window_sendrecv_count"] = _we.get("mpi_window_sendrecv_count", 0)
+    required["mpi_window_commits_saved"] = _we.get("mpi_window_commits_saved", 0)
+    required["mpi_window_estimated_ram_gib"] = _we.get(
+        "mpi_window_estimated_ram_gib", 0.0)
+    required["mpi_window_fallbacks"] = _we.get("mpi_window_fallbacks", 0)
+    required["mpi_window_fallback_reasons"] = _we.get(
+        "mpi_window_fallback_reasons", [])
+    required["expected_recomputation_cost_increase"] = _we.get(
+        "expected_recomputation_cost_increase", 0.0)
+
     if "correct" in result:
         required["correct"] = result["correct"]
     try:
@@ -1761,6 +1794,11 @@ def main(argv: list[str] | None = None) -> None:
                     help="analyze (do not execute) multi-step MPI exchange "
                          "windows: 'report' writes mpi_window_candidates.json + "
                          "mpi_window_report.json; 'off' (default) does nothing")
+    ap.add_argument("--mpi-window-execution", dest="mpi_window_execution",
+                    choices=["off", "safe"], default="off",
+                    help="execute RAM-feasible consecutive true-mixing MPI "
+                         "windows as one gather/apply/scatter + commit: 'safe' "
+                         "enables it; 'off' (default) uses per-step execution")
     ap.add_argument("--kernel-backend", dest="kernel_backend",
                     choices=["numpy", "numba", "auto"], default="auto",
                     help="CPU kernel numerical backend: numpy (baseline) | numba "
@@ -1833,6 +1871,7 @@ def main(argv: list[str] | None = None) -> None:
         extent_io_mode=args.extent_io_mode,
         kernel_backend=args.kernel_backend,
         mpi_window_analysis=args.mpi_window_analysis,
+        mpi_window_execution=args.mpi_window_execution,
     )
 
     if rank == 0:

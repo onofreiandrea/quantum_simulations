@@ -34,6 +34,42 @@ from wenbo_engine.mpi.exchange_planner import classify_gate as _resolve_exchange
 from wenbo_engine.mpi import window_cost_model as cm
 
 
+def annotate_executor_support(circuit_dict: dict, chunk_bits: int,
+                              num_ranks: int,
+                              ram_budget_gib: float | None = None) -> dict:
+    """Link feasibility analysis to the actual executor's selection.
+
+    Analysis-only: reports which *feasibility* candidate windows the real
+    :mod:`wenbo_engine.mpi.window_executor` would execute under
+    ``--mpi-window-execution=safe`` (a stricter subset: pure single-qubit
+    true-mixing rank-bit steps that fit the RAM budget).  Lets a report show
+    "feasible" vs "executor-supported" without changing any behaviour.
+    """
+    from wenbo_engine.circuit.io import validate_circuit_dict, levelize
+    from wenbo_engine.mpi.mpi_runner import _compile_steps
+    from wenbo_engine.mpi.window_executor import plan_executable_windows
+    n = circuit_dict["number_of_qubits"]
+    k, p, n_local_bits = _layout(n, chunk_bits, num_ranks)
+    steps = _compile_steps(levelize(validate_circuit_dict(circuit_dict)),
+                           k, n_local_bits)
+    wins, rejs = plan_executable_windows(
+        steps, k, n_local_bits, num_ranks, 1 << k, ram_budget_gib)
+    return {
+        "executor_supported_windows": [
+            {"start_step": w.start_step, "end_step": w.end_step,
+             "n_steps": w.n_steps, "n_gates": w.n_gates,
+             "group_size": w.group_size,
+             "estimated_ram_gib": w.estimated_ram_gib}
+            for w in wins
+        ],
+        "executor_rejected_windows": [
+            {"start_step": s0, "end_step": s1, "reason": r}
+            for (s0, s1, r) in rejs
+        ],
+        "num_executor_supported_windows": len(wins),
+    }
+
+
 def _layout(n: int, chunk_bits: int, num_ranks: int) -> tuple[int, int, int]:
     """(k, p, n_local_bits) — same convention as the runner / bench."""
     if num_ranks < 1 or (num_ranks & (num_ranks - 1)) != 0:

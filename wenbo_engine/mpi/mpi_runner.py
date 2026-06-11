@@ -90,6 +90,72 @@ def _reset_mpi_telemetry() -> None:
     _MPI_TELE["prev_fetch_set"] = set()
 
 
+# ── per-run MPI true-mixing window-executor telemetry ───────────────────
+# Accumulated only when --mpi-window-execution=safe actually runs a window;
+# stays all-zero (mode "off") otherwise.  Aggregated across ranks at run end.
+_WIN_EXEC = {
+    "mode": "off",
+    "windows_executed": 0, "window_steps_executed": 0,
+    "window_gates_executed": 0, "gather_bytes": 0, "scatter_bytes": 0,
+    "window_sendrecv_count": 0, "commits_saved": 0,
+    "estimated_ram_gib": 0.0, "expected_recomputation_cost_increase": 0.0,
+    "fallbacks": 0, "fallback_reasons": [],
+}
+
+
+def _reset_window_exec(mode: str = "off") -> None:
+    _WIN_EXEC.update(mode=mode, windows_executed=0, window_steps_executed=0,
+                     window_gates_executed=0, gather_bytes=0, scatter_bytes=0,
+                     window_sendrecv_count=0, commits_saved=0,
+                     estimated_ram_gib=0.0,
+                     expected_recomputation_cost_increase=0.0, fallbacks=0)
+    _WIN_EXEC["fallback_reasons"] = []
+
+
+def _finalize_window_exec(work_dir, comm) -> None:
+    """Aggregate window-executor metrics across ranks; write JSON (rank 0)."""
+    w = _WIN_EXEC
+    if comm is not None and comm.Get_size() > 1:
+        s = lambda x: comm.allreduce(int(x), op=MPI.SUM)
+        mx = lambda x: comm.allreduce(float(x), op=MPI.MAX)
+        gather_b = s(w["gather_bytes"]); scatter_b = s(w["scatter_bytes"])
+        sr = s(w["window_sendrecv_count"])
+        est_ram = mx(w["estimated_ram_gib"])
+        # gather fallback reasons from all ranks (rank 0 keeps the union)
+        all_reasons = comm.gather(list(w["fallback_reasons"]), root=0)
+    else:
+        gather_b, scatter_b, sr = (w["gather_bytes"], w["scatter_bytes"],
+                                   w["window_sendrecv_count"])
+        est_ram = w["estimated_ram_gib"]
+        all_reasons = [list(w["fallback_reasons"])]
+    if comm is not None and comm.Get_rank() != 0:
+        return
+    reasons = []
+    for r in (all_reasons or []):
+        for x in r:
+            if x not in reasons:
+                reasons.append(x)
+    out = {
+        "mpi_window_execution_mode": w["mode"],
+        "mpi_windows_executed": w["windows_executed"],
+        "mpi_window_steps_executed": w["window_steps_executed"],
+        "mpi_window_gates_executed": w["window_gates_executed"],
+        "mpi_window_gather_bytes": gather_b,
+        "mpi_window_scatter_bytes": scatter_b,
+        "mpi_window_sendrecv_count": sr,
+        "mpi_window_commits_saved": w["commits_saved"],
+        "mpi_window_estimated_ram_gib": round(est_ram, 6),
+        "mpi_window_fallbacks": w["fallbacks"],
+        "mpi_window_fallback_reasons": reasons,
+        "expected_recomputation_cost_increase":
+            round(w["expected_recomputation_cost_increase"], 6),
+    }
+    try:
+        (Path(work_dir) / "mpi_window_exec.json").write_text(json.dumps(out))
+    except OSError:
+        pass
+
+
 # fraction of the RAM budget reserved for the overlay working set (the rest is
 # headroom for MPI send/recv buffers + remote cache + python/runtime overhead).
 _OVERLAY_BUDGET_FRACTION = 0.75
@@ -1082,6 +1148,7 @@ def run(
     max_remote_buffer_gib: float | None = None,
     auto_chunk_bits: bool = False,
     kernel_backend: str = "auto",
+    mpi_window_execution: str = "off",
 ) -> Path:
     """Run a quantum circuit distributed across MPI ranks.
 
@@ -1115,6 +1182,10 @@ def run(
     from wenbo_engine.kernel import backend as _kbackend
     _kbackend.set_backend(kernel_backend)
     _reset_mpi_telemetry()
+    if mpi_window_execution not in ("off", "safe"):
+        raise ValueError(f"unknown mpi_window_execution {mpi_window_execution!r} "
+                         "(expected off|safe)")
+    _reset_window_exec(mpi_window_execution)
 
     # RAM-aware execution control: resolve per-rank overlay + remote-cache
     # budgets and FAIL EARLY (before any large allocation) if a single chunk +
@@ -1133,10 +1204,13 @@ def run(
                                  storage_layout=storage_layout,
                                  execution_mode=execution_mode,
                                  compute_unit_min_gates=compute_unit_min_gates,
-                                 extent_io_mode=extent_io_mode)
+                                 extent_io_mode=extent_io_mode,
+                                 mpi_window_execution=mpi_window_execution,
+                                 ram_budget_gib=ram_budget_gib)
         _write_ram_metrics(work_dir, comm, ram_meta)
         _write_kernel_metrics(work_dir, comm)
         _finalize_mpi_telemetry(work_dir, comm)
+        _finalize_window_exec(work_dir, comm)
         return result
     # none / wal share the double-buffer path; WAL writes are gated below.
     use_wal = (recovery == "wal")
@@ -1438,6 +1512,80 @@ def _run_compute_units(gm, comm, rank, work, steps, cur_gen,
     return cur_gen
 
 
+# ── true-mixing window execution (generation mode) ─────────────────────
+
+def _execute_window_gen(gm, comm, rank, work, win, cur_gen, n_chunks_per_rank,
+                        chunk_size, fault_injector, crash_after) -> int:
+    """Execute one fused true-mixing window: gather/apply/scatter + 1 commit.
+
+    Reads committed generation ``cur_gen`` (== ``win.start_step``), applies all
+    the window's gates via :func:`window_executor.execute_window`, and commits a
+    single generation ``win.end_step + 1`` (preserving the invariant generation
+    == completed steps).  A crash before the commit leaves no new generation, so
+    recovery rolls back to ``cur_gen``; a crash after it recovers the window
+    generation.  Returns the new generation number (== next start step).
+    """
+    from wenbo_engine.recovery.generation_manager import gen_dir
+    from wenbo_engine.faults.fault_points import FaultPoint
+    from wenbo_engine.mpi.window_executor import execute_window, WindowExecMetrics
+    from wenbo_engine.mpi import window_cost_model as _cm
+
+    next_gen = win.end_step + 1
+    src_dir = gen_dir(work, rank, cur_gen)
+    dst_dir = gen_dir(work, rank, next_gen)
+    (dst_dir / "chunks").mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+
+    # Crash BEFORE any dst write / commit → recovery keeps cur_gen.
+    fault_injector.maybe_fire(FaultPoint.AFTER_READ, rank, win.start_step)
+
+    wm = WindowExecMetrics()
+    execute_window(comm, rank, win, src_dir / "chunks", dst_dir / "chunks",
+                   n_chunks_per_rank, chunk_size, wm)
+
+    def _writer(cdir: Path):
+        recs = []
+        for ci in range(n_chunks_per_rank):
+            recs.append(gm.chunk_record(cdir, ci))
+            if ci == 0:
+                fault_injector.maybe_fire(
+                    FaultPoint.AFTER_PARTIAL_WRITE, rank, win.end_step)
+        return recs
+
+    rec = gm.commit_step(next_gen, win.end_step, _writer,
+                         parent_generation=cur_gen)
+    if rec is None:
+        raise RuntimeError(
+            f"window commit aborted at steps {win.start_step}-{win.end_step} "
+            f"(gen {next_gen})")
+
+    _WIN_EXEC["windows_executed"] += 1
+    _WIN_EXEC["window_steps_executed"] += win.n_steps
+    _WIN_EXEC["window_gates_executed"] += win.n_gates
+    _WIN_EXEC["gather_bytes"] += wm.gather_bytes
+    _WIN_EXEC["scatter_bytes"] += wm.scatter_bytes
+    _WIN_EXEC["window_sendrecv_count"] += wm.window_sendrecv_count
+    _WIN_EXEC["commits_saved"] += (win.n_steps - 1)
+    _WIN_EXEC["estimated_ram_gib"] = max(
+        _WIN_EXEC["estimated_ram_gib"], win.estimated_ram_gib)
+    _WIN_EXEC["expected_recomputation_cost_increase"] += \
+        _cm.recomputation_cost_increase(win.n_gates, win.n_steps, 1)
+
+    if rank == 0:
+        log.info("  window steps %d-%d (%d gates, group=%d) -> gen %d in %.1fs",
+                 win.start_step, win.end_step, win.n_gates, win.group_size,
+                 next_gen, time.time() - t0)
+
+    # Crash AFTER window commit → recovery resumes from the window generation.
+    if crash_after is not None and next_gen >= crash_after:
+        if rank == 0:
+            log.info(f"Crash injection after window commit (gen {next_gen})")
+        comm.Barrier()
+        os._exit(1)
+
+    return next_gen
+
+
 # ── generation-based recovery run ──────────────────────────────────────
 
 def _run_generation(circuit_dict: dict, work_dir: str | Path,
@@ -1447,7 +1595,9 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
                     storage_layout: str = "chunks",
                     execution_mode: str = "step",
                     compute_unit_min_gates: int = 4,
-                    extent_io_mode: str = "materialize") -> Path:
+                    extent_io_mode: str = "materialize",
+                    mpi_window_execution: str = "off",
+                    ram_budget_gib: float | None = None) -> Path:
     """Distributed run with generation-based recovery (--recovery=generation).
 
     Reuses the same compiled steps and :func:`_apply_step` kernel pipeline as
@@ -1563,8 +1713,43 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
             storage_layout, fault_injector, min_gates=compute_unit_min_gates,
             extent_io_mode=extent_io_mode)
 
-    for step_idx in ([] if execution_mode == "compute_unit"
-                     else range(start_step, len(steps))):
+    # MPI true-mixing window executor (opt-in: --mpi-window-execution=safe).
+    # Off by default and only in the per-step path (chunks layout, step mode);
+    # selects RAM-feasible runs of consecutive 1q true-mixing MPI steps to run
+    # as one gather/apply/scatter + single commit.  Everything else, and every
+    # rejected window, falls back to the unchanged per-step path below.
+    window_start: dict = {}
+    if (mpi_window_execution == "safe" and execution_mode != "compute_unit"
+            and storage_layout == "chunks"):
+        from wenbo_engine.mpi.window_executor import plan_executable_windows
+        wins, rejs = plan_executable_windows(
+            steps, k, n_local_bits, n_ranks, chunk_size, ram_budget_gib)
+        window_start = {w.start_step: w for w in wins}
+        for (_s0, _s1, _reason) in rejs:
+            _WIN_EXEC["fallbacks"] += 1
+            if _reason not in _WIN_EXEC["fallback_reasons"]:
+                _WIN_EXEC["fallback_reasons"].append(_reason)
+        if rank == 0 and (wins or rejs):
+            log.info("window executor: %d executable window(s), %d rejected",
+                     len(wins), len(rejs))
+    elif (mpi_window_execution == "safe" and rank == 0
+          and execution_mode != "step"):
+        _WIN_EXEC["fallback_reasons"].append(
+            f"execution_mode={execution_mode!r} not supported by window executor")
+
+    step_idx = start_step
+    _end = 0 if execution_mode == "compute_unit" else len(steps)
+    while step_idx < _end:
+        # ── window branch: execute a fused true-mixing window ──────────
+        win = window_start.get(step_idx)
+        if win is not None:
+            step_idx = _execute_window_gen(
+                gm, comm, rank, work, win, cur_gen, n_chunks_per_rank,
+                chunk_size, fault_injector, crash_after)
+            cur_gen = step_idx  # generation == completed steps
+            gm.prune(keep_generations=3)
+            continue
+
         t0 = time.time()
         step = steps[step_idx]
         next_gen = cur_gen + 1
@@ -1634,6 +1819,8 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
                 log.info(f"Crash injection after step {step_idx + 1}")
             comm.Barrier()
             os._exit(1)
+
+        step_idx += 1
 
     return gen_dir(work, rank, cur_gen)
 
