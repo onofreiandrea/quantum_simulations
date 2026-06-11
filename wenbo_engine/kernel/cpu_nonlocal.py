@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from wenbo_engine.kernel import backend
+
 try:
     import numba
 
@@ -92,7 +94,7 @@ except ImportError:
 
 def apply_1q_pair(c0: np.ndarray, c1: np.ndarray, U: np.ndarray) -> None:
     """1-qubit gate across two partner chunks.  Modifies both in-place."""
-    if _HAS_NUMBA:
+    if backend.use_numba():
         _apply_1q_pair_numba(c0, c1, U[0, 0], U[0, 1], U[1, 0], U[1, 1])
         return
     tmp = U[0, 0] * c0 + U[0, 1] * c1
@@ -103,7 +105,7 @@ def apply_1q_pair(c0: np.ndarray, c1: np.ndarray, U: np.ndarray) -> None:
 def apply_2q_pair_qa_local(c0: np.ndarray, c1: np.ndarray,
                            qa: int, U: np.ndarray) -> None:
     """2-qubit gate: qa local, qb non-local."""
-    if _HAS_NUMBA:
+    if backend.use_numba():
         _apply_2q_pair_qa_local_numba(c0, c1, qa, np.ascontiguousarray(U))
         return
     step = 1 << qa
@@ -126,7 +128,7 @@ def apply_2q_pair_qa_local(c0: np.ndarray, c1: np.ndarray,
 def apply_2q_pair_qb_local(c0: np.ndarray, c1: np.ndarray,
                            qb: int, U: np.ndarray) -> None:
     """2-qubit gate: qa non-local, qb local."""
-    if _HAS_NUMBA:
+    if backend.use_numba():
         _apply_2q_pair_qb_local_numba(c0, c1, qb, np.ascontiguousarray(U))
         return
     step = 1 << qb
@@ -150,7 +152,7 @@ def apply_2q_quad(c00: np.ndarray, c01: np.ndarray,
                   c10: np.ndarray, c11: np.ndarray,
                   U: np.ndarray) -> None:
     """2-qubit gate: both qubits non-local.  Element-wise across 4 chunks."""
-    if _HAS_NUMBA:
+    if backend.use_numba():
         _apply_2q_quad_numba(c00, c01, c10, c11, np.ascontiguousarray(U))
         return
     V = np.stack([c00, c01, c10, c11])

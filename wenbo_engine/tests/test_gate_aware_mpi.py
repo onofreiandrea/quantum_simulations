@@ -211,3 +211,30 @@ def test_remote_buffer_cache_correct_under_budget():
     cache.put(2, 0, a.copy())                            # exceeds -> LRU evict
     assert cache.evictions >= 1
     assert cache._bytes <= cache.max_bytes
+
+
+# ── backend selection: nonlocal pair kernel equivalent numpy vs numba ───
+
+def test_nonlocal_kernel_backend_equivalent():
+    import numpy as np
+    from wenbo_engine.kernel import backend
+    from wenbo_engine.kernel.cpu_nonlocal import apply_1q_pair
+    from wenbo_engine.storage.block_store import DTYPE
+    rng = np.random.default_rng(5)
+    a0 = (rng.standard_normal(8) + 1j*rng.standard_normal(8)).astype(DTYPE)
+    b0 = (rng.standard_normal(8) + 1j*rng.standard_normal(8)).astype(DTYPE)
+    H = (np.array([[1, 1], [1, -1]], dtype=DTYPE) / np.sqrt(2))
+    out = {}
+    backends = ["numpy", "numba"] if backend.numba_available() else ["numpy"]
+    try:
+        for be in backends:
+            backend.set_backend(be)
+            a, b = a0.copy(), b0.copy()
+            apply_1q_pair(a, b, H)
+            out[be] = (a, b)
+            assert a.dtype == DTYPE and b.dtype == DTYPE
+    finally:
+        backend.set_backend("numpy")
+    if "numba" in out:
+        assert np.allclose(out["numpy"][0], out["numba"][0], atol=1e-5)
+        assert np.allclose(out["numpy"][1], out["numba"][1], atol=1e-5)

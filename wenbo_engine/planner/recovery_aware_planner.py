@@ -246,8 +246,14 @@ def plan_recovery_aware(circuit_dict: dict, *, n: int, chunk_bits: int,
                         ram_budget_gib: float | None = None,
                         max_overlay_chunks: int | None = None,
                         max_remote_buffer_gib: float | None = None,
-                        auto_chunk_bits: bool = False) -> dict:
-    """Run the full recovery-aware planner; return the plan + decision dict."""
+                        auto_chunk_bits: bool = False,
+                        kernel_backend: str = "auto") -> dict:
+    """Run the full recovery-aware planner; return the plan + decision dict.
+
+    ``kernel_backend`` is orthogonal to strategy selection (numpy/numba/auto is
+    a per-process numerical-backend choice, not a layout/execution decision); it
+    is recorded in the plan for traceability but does not affect the candidates.
+    """
     ctx = build_plan_context(
         circuit_dict, n=n, chunk_bits=chunk_bits, num_ranks=num_ranks,
         recovery=recovery, compute_unit_min_gates=compute_unit_min_gates,
@@ -291,6 +297,7 @@ def plan_recovery_aware(circuit_dict: dict, *, n: int, chunk_bits: int,
         "candidates": estimates,
         "stage_plans": [sp.to_dict() for sp in stage_plans],
         "ram": ram,
+        "kernel_backend": kernel_backend,
     }
 
 

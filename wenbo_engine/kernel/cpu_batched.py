@@ -1,12 +1,15 @@
 """CPU batched kernel: gather → GEMM → scatter.
 
-Uses numba JIT compilation for zero-copy, single-pass gate application.
-Falls back to numpy if numba is not installed.
+Uses numba JIT compilation for zero-copy, single-pass gate application when the
+active numerical backend is numba (see :mod:`wenbo_engine.kernel.backend`);
+otherwise uses the pure-numpy path.  Both paths are in-place and bit-for-bit
+equivalent up to floating-point rounding — precision (complex64) is unchanged.
 """
 from __future__ import annotations
 
 import numpy as np
 from wenbo_engine.kernel.cpu_scalar import check_local
+from wenbo_engine.kernel import backend
 
 try:
     import numba
@@ -60,7 +63,7 @@ except ImportError:
 
 def apply_1q(chunk: np.ndarray, qubit: int, U: np.ndarray) -> None:
     check_local(qubit, len(chunk))
-    if _HAS_NUMBA:
+    if backend.use_numba():
         _apply_1q_numba(chunk, qubit, U[0, 0], U[0, 1], U[1, 0], U[1, 1])
         return
     step = 1 << qubit
@@ -79,7 +82,7 @@ def apply_2q(chunk: np.ndarray, qa: int, qb: int, U: np.ndarray) -> None:
         qa, qb = qb, qa
         perm = [0, 2, 1, 3]
         U = U[np.ix_(perm, perm)]
-    if _HAS_NUMBA:
+    if backend.use_numba():
         _apply_2q_numba(chunk, qa, qb, np.ascontiguousarray(U))
         return
     N = len(chunk)

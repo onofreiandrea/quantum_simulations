@@ -146,6 +146,25 @@ def _write_ram_metrics(work_dir, comm, ram_meta: dict) -> None:
         pass
 
 
+def _write_kernel_metrics(work_dir, comm) -> None:
+    """Write kernel_metrics.json (rank 0) with the active numerical backend."""
+    if comm is not None and comm.Get_rank() != 0:
+        return
+    from wenbo_engine.kernel import backend as _kb
+    info = _kb.backend_info()
+    out = {
+        "kernel_backend_requested": info["requested"],
+        "kernel_backend_used": info["used"],
+        "kernel_backend_available": info["available"],
+        "numba_compile_time": info["compile_time"],
+        "backend_fallback_reason": info["fallback_reason"],
+    }
+    try:
+        (Path(work_dir) / "kernel_metrics.json").write_text(json.dumps(out))
+    except OSError:
+        pass
+
+
 # ── helpers ────────────────────────────────────────────────────────────
 
 def _circuit_hash(circuit_dict: dict) -> str:
@@ -946,6 +965,7 @@ def run(
     max_overlay_chunks: int | None = None,
     max_remote_buffer_gib: float | None = None,
     auto_chunk_bits: bool = False,
+    kernel_backend: str = "auto",
 ) -> Path:
     """Run a quantum circuit distributed across MPI ranks.
 
@@ -973,6 +993,12 @@ def run(
         raise ValueError(f"unknown recovery mode {recovery!r} "
                          "(expected none|wal|generation)")
 
+    # Numerical backend selection (numpy/numba/auto): explicit, safe fallback to
+    # numpy if numba is unavailable or fails to compile.  Per-process; every
+    # rank selects identically.
+    from wenbo_engine.kernel import backend as _kbackend
+    _kbackend.set_backend(kernel_backend)
+
     # RAM-aware execution control: resolve per-rank overlay + remote-cache
     # budgets and FAIL EARLY (before any large allocation) if a single chunk +
     # kernel temp cannot fit the budget.  No-op when ram_budget_gib is None
@@ -992,6 +1018,7 @@ def run(
                                  compute_unit_min_gates=compute_unit_min_gates,
                                  extent_io_mode=extent_io_mode)
         _write_ram_metrics(work_dir, comm, ram_meta)
+        _write_kernel_metrics(work_dir, comm)
         return result
     # none / wal share the double-buffer path; WAL writes are gated below.
     use_wal = (recovery == "wal")
@@ -1132,6 +1159,7 @@ def run(
             os._exit(1)
 
     _write_ram_metrics(work_dir, comm, ram_meta)
+    _write_kernel_metrics(work_dir, comm)
     return src_dir  # committed state directory
 
 
