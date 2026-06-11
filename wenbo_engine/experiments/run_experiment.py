@@ -174,19 +174,42 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
     # (deterministic) and override the cfg execution params accordingly, so the
     # selection flows into the run and into config.json.  No qubit reorder.
     recovery_aware_plan = None
+    _auto_cb = bool(getattr(cfg, "auto_chunk_bits", False))
+    _ram_budget = getattr(cfg, "ram_budget_gib", None)
+    _max_overlay = getattr(cfg, "max_overlay_chunks", None)
+    _max_remote = getattr(cfg, "max_remote_buffer_gib", None)
+    if _auto_cb and _ram_budget is None:
+        try:
+            import os as _os
+            _tot = _os.sysconf("SC_PAGE_SIZE") * _os.sysconf("SC_PHYS_PAGES")
+            _ram_budget = round(_tot / (1 << 30) * 0.70, 3)
+        except (ValueError, OSError, AttributeError):
+            _ram_budget = None
     if getattr(cfg, "planner", None) == "recovery_aware_v1":
         import math as _m
         from wenbo_engine.planner import plan_recovery_aware, selected_run_params
         recovery_aware_plan = plan_recovery_aware(
             circuit, n=n, chunk_bits=int(_m.log2(chunk_size)),
             num_ranks=n_ranks, recovery=cfg.resolved_recovery(),
-            compute_unit_min_gates=getattr(cfg, "compute_unit_min_gates", 4))
+            compute_unit_min_gates=getattr(cfg, "compute_unit_min_gates", 4),
+            ram_budget_gib=_ram_budget, max_overlay_chunks=_max_overlay,
+            max_remote_buffer_gib=_max_remote, auto_chunk_bits=_auto_cb)
         _rp = selected_run_params(recovery_aware_plan)
         cfg.storage_layout = _rp["storage_layout"]
         cfg.execution_mode = _rp["execution_mode"]
         cfg.extent_io_mode = _rp["extent_io_mode"]
         cfg.mpi_exchange_mode = _rp["mpi_exchange_mode"]
         cfg.compute_unit_min_gates = _rp["compute_unit_min_gates"]
+        # RAM-aware: adopt the recommended chunk_bits (config circuits don't
+        # depend on chunk_bits, so no circuit rebuild is needed).
+        if _auto_cb:
+            _rec = recovery_aware_plan["ram"].get("recommended_chunk_bits")
+            if _rec is None:
+                raise RuntimeError(
+                    f"RAM-infeasible: no chunk_bits fits the {_ram_budget} "
+                    f"GiB/rank budget for n={n} on {n_ranks} ranks.")
+            chunk_size = 1 << _rec
+    cfg.ram_budget_gib = _ram_budget   # resolved value flows to _run_mpi
 
     run_id = _make_run_id(cfg, circuit)
     if comm is not None:
@@ -329,6 +352,20 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
             _extra["planner"] = "recovery_aware_v1"
             _extra["selected_strategy"] = \
                 recovery_aware_plan["decision"]["selected_strategy"]["name"]
+            _extra["estimated_peak_ram_gib"] = \
+                recovery_aware_plan["ram"].get("estimated_peak_ram_gib")
+            _extra["recommended_chunk_bits"] = \
+                recovery_aware_plan["ram"].get("recommended_chunk_bits")
+        _extra["auto_chunk_bits_enabled"] = bool(getattr(cfg, "auto_chunk_bits", False))
+        _extra["ram_budget_gib"] = getattr(cfg, "ram_budget_gib", None)
+        try:
+            _rm = json.loads((work_dir / "ram_metrics.json").read_text())
+            for _k in ("chunk_bits", "chunk_bytes", "max_overlay_chunks",
+                       "max_remote_buffer_gib", "overlay_peak_ram_gib",
+                       "remote_buffer_peak_gib", "ram_feasible"):
+                _extra[_k] = _rm.get(_k)
+        except (OSError, ValueError):
+            pass
         summary_mod.write_summary(run_dir, extra=_extra)
     if comm is not None:
         comm.Barrier()
@@ -408,7 +445,11 @@ def _run_mpi(cfg, circuit, work_dir, chunk_size, run_dir, comm, n_ranks, rank):
                    storage_layout=getattr(cfg, "storage_layout", "chunks"),
                    execution_mode=getattr(cfg, "execution_mode", "step"),
                    compute_unit_min_gates=getattr(cfg, "compute_unit_min_gates", 4),
-                   extent_io_mode=getattr(cfg, "extent_io_mode", "materialize"))
+                   extent_io_mode=getattr(cfg, "extent_io_mode", "materialize"),
+                   ram_budget_gib=getattr(cfg, "ram_budget_gib", None),
+                   max_overlay_chunks=getattr(cfg, "max_overlay_chunks", None),
+                   max_remote_buffer_gib=getattr(cfg, "max_remote_buffer_gib", None),
+                   auto_chunk_bits=bool(getattr(cfg, "auto_chunk_bits", False)))
     comm.Barrier()
 
     # Durable R4: promote committed generations to durable storage AFTER the
@@ -602,6 +643,19 @@ def main(argv=None) -> int:
                     help="MPI-nonlocal exchange path: naive (one Sendrecv per "
                          "chunk per gate) or gate_aware (batch per-partner + "
                          "reuse received remote chunks).")
+    # ── RAM-aware execution control ──
+    ap.add_argument("--ram-budget-gib", dest="ram_budget_gib", type=float,
+                    default=None,
+                    help="per-rank RAM budget for the working set (default: 70%% "
+                         "of node RAM when --auto-chunk-bits is set).")
+    ap.add_argument("--auto-chunk-bits", dest="auto_chunk_bits",
+                    action="store_true",
+                    help="pick the largest chunk_bits whose peak RAM fits the "
+                         "budget; fail early if none fits.")
+    ap.add_argument("--max-overlay-chunks", dest="max_overlay_chunks", type=int,
+                    default=None)
+    ap.add_argument("--max-remote-buffer-gib", dest="max_remote_buffer_gib",
+                    type=float, default=None)
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -619,6 +673,10 @@ def main(argv=None) -> int:
     cfg.compute_unit_min_gates = args.compute_unit_min_gates
     cfg.extent_io_mode = args.extent_io_mode
     cfg.mpi_exchange_mode = args.mpi_exchange_mode
+    cfg.ram_budget_gib = args.ram_budget_gib
+    cfg.auto_chunk_bits = args.auto_chunk_bits
+    cfg.max_overlay_chunks = args.max_overlay_chunks
+    cfg.max_remote_buffer_gib = args.max_remote_buffer_gib
     cfg.validate()
 
     run_dir = run_experiment(cfg, run_id=args.run_id)

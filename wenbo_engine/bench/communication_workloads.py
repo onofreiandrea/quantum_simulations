@@ -178,6 +178,16 @@ def _rank_bits(num_ranks: int) -> int:
     return int(round(math.log2(num_ranks)))
 
 
+def _available_ram_gib() -> float:
+    """Total physical RAM (GiB) on this node, via sysconf (no psutil dep)."""
+    try:
+        import os as _os
+        total = _os.sysconf("SC_PAGE_SIZE") * _os.sysconf("SC_PHYS_PAGES")
+        return total / (1 << 30)
+    except (ValueError, OSError, AttributeError):
+        return 0.0
+
+
 # ── generators ─────────────────────────────────────────────────────────
 
 def communication_light(n: int, depth: int, seed: int = 42) -> dict:
@@ -766,7 +776,11 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                  storage_layout: str = "chunks",
                  execution_mode: str = "step",
                  compute_unit_min_gates: int = 4,
-                 extent_io_mode: str = "materialize") -> dict:
+                 extent_io_mode: str = "materialize",
+                 ram_budget_gib: float | None = None,
+                 auto_chunk_bits: bool = False,
+                 max_overlay_chunks: int | None = None,
+                 max_remote_buffer_gib: float | None = None) -> dict:
     """Run a communication workload under instrumentation.
 
     Builds the circuit, optionally applies production reordering
@@ -809,6 +823,12 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
     # artifact bundle regardless.  ``current`` / None are behavior-preserving.
     planner_perm = None
     recovery_aware_plan = None
+    # Resolve the RAM working-set budget (70% of node RAM if not given) when any
+    # RAM-aware control is active.
+    ram_budget_resolved = None
+    if auto_chunk_bits or ram_budget_gib is not None:
+        ram_budget_resolved = (ram_budget_gib if ram_budget_gib is not None
+                               else round(_available_ram_gib() * 0.70, 3))
     if planner == "recovery_aware_v1":
         # Recovery-aware planner v1: evaluate candidate strategies and SELECT
         # the run's (storage_layout, execution_mode, extent_io_mode,
@@ -818,7 +838,33 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         from wenbo_engine.planner import plan_recovery_aware, selected_run_params
         recovery_aware_plan = plan_recovery_aware(
             cd, n=n, chunk_bits=chunk_bits, num_ranks=num_ranks,
-            recovery=recovery, compute_unit_min_gates=compute_unit_min_gates)
+            recovery=recovery, compute_unit_min_gates=compute_unit_min_gates,
+            ram_budget_gib=ram_budget_resolved,
+            max_overlay_chunks=max_overlay_chunks,
+            max_remote_buffer_gib=max_remote_buffer_gib,
+            auto_chunk_bits=auto_chunk_bits)
+        # RAM-aware auto chunk_bits: adopt the recommended chunk_bits and
+        # re-plan (the circuit's gate placement depends on chunk_bits, so the
+        # circuit is rebuilt too).
+        if auto_chunk_bits:
+            rec_cb = recovery_aware_plan["ram"].get("recommended_chunk_bits")
+            if rec_cb is None:
+                raise RuntimeError(
+                    f"RAM-infeasible: no chunk_bits fits the {ram_budget_resolved} "
+                    f"GiB/rank budget for {kind} n={n} on {num_ranks} ranks "
+                    f"(selected {recovery_aware_plan['decision']['selected_strategy']['name']}).")
+            if rec_cb != chunk_bits:
+                chunk_bits = rec_cb
+                chunk_size = 1 << chunk_bits
+                cd = build_circuit(kind, n, depth, chunk_bits, num_ranks, seed)
+                recovery_aware_plan = plan_recovery_aware(
+                    cd, n=n, chunk_bits=chunk_bits, num_ranks=num_ranks,
+                    recovery=recovery,
+                    compute_unit_min_gates=compute_unit_min_gates,
+                    ram_budget_gib=ram_budget_resolved,
+                    max_overlay_chunks=max_overlay_chunks,
+                    max_remote_buffer_gib=max_remote_buffer_gib,
+                    auto_chunk_bits=auto_chunk_bits)
         _rp = selected_run_params(recovery_aware_plan)
         storage_layout = _rp["storage_layout"]
         execution_mode = _rp["execution_mode"]
@@ -826,8 +872,9 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         mpi_exchange_mode = _rp["mpi_exchange_mode"]
         compute_unit_min_gates = _rp["compute_unit_min_gates"]
         if rank == 0:
-            log.info("  recovery_aware_v1 selected: %s",
-                     recovery_aware_plan["decision"]["selected_strategy"]["name"])
+            log.info("  recovery_aware_v1 selected: %s (chunk_bits=%d)",
+                     recovery_aware_plan["decision"]["selected_strategy"]["name"],
+                     chunk_bits)
     elif planner is not None and planner != "current":
         from wenbo_engine.planner import ABLATION_MODES
         from wenbo_engine.planner.placement_planner import (
@@ -860,7 +907,11 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
                 recovery=recovery, mpi_exchange_mode=mpi_exchange_mode,
                 storage_layout=storage_layout, execution_mode=execution_mode,
                 compute_unit_min_gates=compute_unit_min_gates,
-                extent_io_mode=extent_io_mode)
+                extent_io_mode=extent_io_mode,
+                ram_budget_gib=ram_budget_resolved,
+                max_overlay_chunks=max_overlay_chunks,
+                max_remote_buffer_gib=max_remote_buffer_gib,
+                auto_chunk_bits=auto_chunk_bits)
         elif recovery == "generation":
             raise RuntimeError(
                 "recovery='generation' requires the generation-recovery "
@@ -882,6 +933,15 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
             overlay_metrics = json.loads(om_path.read_text())
         except (OSError, ValueError):
             overlay_metrics = {}
+
+    # RAM-aware execution metrics (budgets + measured peaks), written by run().
+    ram_metrics = {}
+    rm_path = Path(work_dir) / "ram_metrics.json"
+    if rm_path.exists():
+        try:
+            ram_metrics = json.loads(rm_path.read_text())
+        except (OSError, ValueError):
+            ram_metrics = {}
 
     # Durable R4 (optional): promote committed generations AFTER the run — a
     # separate, explicit step, never during gate execution.  Only valid in
@@ -942,6 +1002,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         "execution_mode": execution_mode,
         "extent_io_mode": extent_io_mode,
         "overlay_metrics": overlay_metrics,
+        "ram_metrics": ram_metrics,
+        "auto_chunk_bits_enabled": bool(auto_chunk_bits),
         "intended_locality": INTENDED_LOCALITY.get(kind, "unknown"),
         # Clifford / stabilizer analysis of the generated circuit
         "total_gate_count": clifford["total_gate_count"],
@@ -1363,6 +1425,24 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
                 "overlay_bytes_written"):
         if _kk in _om:
             required[_kk] = _om[_kk]
+
+    # ── RAM-aware execution fields (measured by run() + planner estimate) ──
+    _rm = result.get("ram_metrics") or {}
+    required["auto_chunk_bits_enabled"] = bool(result.get("auto_chunk_bits_enabled"))
+    required["chunk_bits"] = _rm.get("chunk_bits", result.get("chunk_bits"))
+    required["chunk_bytes"] = _rm.get("chunk_bytes")
+    required["ram_budget_gib"] = _rm.get("ram_budget_gib")
+    required["max_overlay_chunks"] = _rm.get("max_overlay_chunks")
+    required["max_remote_buffer_gib"] = _rm.get("max_remote_buffer_gib")
+    required["overlay_peak_ram_gib"] = _rm.get("overlay_peak_ram_gib")
+    required["remote_buffer_peak_gib"] = _rm.get("remote_buffer_peak_gib")
+    required["measured_peak_working_set_gib"] = _rm.get("measured_peak_working_set_gib")
+    required["ram_feasible"] = _rm.get("ram_feasible")
+    _raram = (result.get("recovery_aware") or {}).get("plan", {}).get("ram", {}) \
+        if result.get("recovery_aware") else {}
+    required["estimated_peak_ram_gib"] = _raram.get("estimated_peak_ram_gib")
+    required["recommended_chunk_bits"] = _raram.get("recommended_chunk_bits")
+
     if "correct" in result:
         required["correct"] = result["correct"]
     try:
@@ -1460,6 +1540,24 @@ def main(argv: list[str] | None = None) -> None:
                          "logical chunks straight from source extent slices and "
                          "write dirty chunks straight into destination extents, "
                          "no temp chunk files).")
+    # ── RAM-aware execution control ──
+    ap.add_argument("--ram-budget-gib", dest="ram_budget_gib", type=float,
+                    default=None,
+                    help="per-rank RAM budget for the working set (overlay + "
+                         "remote cache + temps). Default: 70%% of node RAM when "
+                         "--auto-chunk-bits is set.")
+    ap.add_argument("--auto-chunk-bits", dest="auto_chunk_bits",
+                    action="store_true",
+                    help="pick the largest chunk_bits whose predicted peak RAM "
+                         "fits the budget (fails early if none fits).")
+    ap.add_argument("--max-overlay-chunks", dest="max_overlay_chunks", type=int,
+                    default=None,
+                    help="cap resident compute-unit overlay chunks (default: "
+                         "derived from the RAM budget).")
+    ap.add_argument("--max-remote-buffer-gib", dest="max_remote_buffer_gib",
+                    type=float, default=None,
+                    help="cap the gate-aware remote-buffer cache (GiB/rank); "
+                         "default: 25%% of the RAM budget.")
     ap.add_argument("--verify", action="store_true",
                     help="collect full state and compare to ref_dense (small n)")
     ap.add_argument("--durable.enabled", dest="durable_enabled",
@@ -1520,6 +1618,10 @@ def main(argv: list[str] | None = None) -> None:
         storage_layout=args.storage_layout,
         execution_mode=args.execution_mode,
         compute_unit_min_gates=args.compute_unit_min_gates,
+        ram_budget_gib=args.ram_budget_gib,
+        auto_chunk_bits=args.auto_chunk_bits,
+        max_overlay_chunks=args.max_overlay_chunks,
+        max_remote_buffer_gib=args.max_remote_buffer_gib,
         extent_io_mode=args.extent_io_mode,
     )
 

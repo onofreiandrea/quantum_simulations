@@ -50,6 +50,9 @@ class MemoryOverlay:
         self.writeback_count = 0
         self.bytes_read = 0
         self.bytes_written = 0
+        # RAM high-water mark: peak resident bytes (chunks held in RAM at once)
+        self._resident_bytes = 0
+        self.peak_resident_bytes = 0
 
     # ── load / access ────────────────────────────────────────────────────
     def get(self, chunk_id: int) -> np.ndarray:
@@ -65,6 +68,9 @@ class MemoryOverlay:
         self._resident[chunk_id] = arr
         self.load_count += 1
         self.bytes_read += int(arr.nbytes)
+        self._resident_bytes += int(arr.nbytes)
+        if self._resident_bytes > self.peak_resident_bytes:
+            self.peak_resident_bytes = self._resident_bytes
         return arr
 
     def mark_dirty(self, chunk_id: int) -> None:
@@ -104,10 +110,10 @@ class MemoryOverlay:
         while len(self._resident) >= self.budget:
             for cid in list(self._resident):
                 if cid not in self._dirty:
-                    self._resident.pop(cid)
+                    self._resident_bytes -= int(self._resident.pop(cid).nbytes)
                     break
             else:
                 # all resident chunks are dirty — flush the LRU one first
                 cid = next(iter(self._resident))
                 self.writeback(cid)
-                self._resident.pop(cid)
+                self._resident_bytes -= int(self._resident.pop(cid).nbytes)
