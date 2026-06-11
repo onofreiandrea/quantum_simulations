@@ -41,6 +41,39 @@ from wenbo_engine.mpi.diagonal_nonlocal import classify_nonlocal_gate
 _GIB = 1 << 30
 _ITEMSIZE = 8  # complex64
 
+# The leader co-resides the rank group's data while applying the window gates.
+# To stay within budget at any scale we GATHER IN SEGMENTS along the chunk (the
+# 1q rank-bit gates act independently per amplitude offset, so segmenting is
+# exact).  The leader holds ~``_LEADER_COPY_FACTOR`` arrays of
+# ``group_size * seg_len`` (recv buffer, pattern-ordered buffer, send buffer,
+# and one tensordot temporary), plus the rank's own src+dst chunk.
+_LEADER_COPY_FACTOR = 4
+_WINDOW_BUDGET_FRACTION = 0.5   # cap the leader's window working set at half budget
+
+
+def plan_segment(chunk_size: int, group_size: int,
+                 ram_budget_gib: float | None) -> tuple[int | None, float]:
+    """Choose a gather segment length that keeps the leader within budget.
+
+    Returns ``(seg_len, estimated_peak_gib)``.  ``seg_len`` is ``None`` when not
+    even ``src + dst`` chunks fit the budget fraction (caller must fall back).
+    With no budget, the whole chunk is one segment (legacy/unbounded).
+    """
+    chunk_bytes = chunk_size * _ITEMSIZE
+    if ram_budget_gib is None or ram_budget_gib <= 0:
+        peak = (2 * chunk_bytes + _LEADER_COPY_FACTOR * group_size
+                * chunk_bytes) / _GIB
+        return chunk_size, peak
+    budget = _WINDOW_BUDGET_FRACTION * ram_budget_gib * _GIB
+    base = 2 * chunk_bytes                       # rank's own src + dst chunk
+    avail = budget - base
+    if avail <= _LEADER_COPY_FACTOR * group_size * _ITEMSIZE:
+        return None, base / _GIB                 # cannot fit even one segment
+    seg_len = int(avail // (_LEADER_COPY_FACTOR * group_size * _ITEMSIZE))
+    seg_len = max(1, min(chunk_size, seg_len))
+    peak = (base + _LEADER_COPY_FACTOR * group_size * seg_len * _ITEMSIZE) / _GIB
+    return seg_len, peak
+
 
 @dataclass
 class ExecutableWindow:
@@ -52,6 +85,8 @@ class ExecutableWindow:
     gates: list               # [(rank_bit_position, U), ...] in execution order
     group_size: int           # 2^len(rank_bits)
     estimated_ram_gib: float
+    seg_len: int = 0          # gather segment length (amplitudes) keeping leader in budget
+    chunk_size: int = 0
 
     @property
     def n_steps(self) -> int:
@@ -158,21 +193,23 @@ def plan_executable_windows(steps, k: int, n_local_bits: int, num_ranks: int,
                 gates.append((rb, U))
         sorted_bits = sorted(rank_bits)
         group_size = 1 << len(sorted_bits)
-        # leader holds recv (group_size chunks) + send (group_size chunks)
-        est_ram = ram_overhead_factor * group_size * chunk_bytes / _GIB
-        if ram_budget_gib is not None and est_ram > ram_budget_gib:
-            rejections.append((s0, s1,
-                               f"estimated_ram_gib={est_ram:.4f} exceeds "
-                               f"ram_budget_gib={ram_budget_gib}"))
-            continue
         if group_size > num_ranks:
             rejections.append((s0, s1, "rank group larger than communicator"))
+            continue
+        # Bound the leader's resident memory by gathering in segments.  Reject
+        # (fall back) only if not even src+dst chunks fit the budget fraction.
+        seg_len, est_ram = plan_segment(chunk_size, group_size, ram_budget_gib)
+        if seg_len is None:
+            rejections.append((s0, s1,
+                               f"src+dst chunk ({2 * chunk_bytes / _GIB:.4f} GiB) "
+                               f"exceeds window RAM budget fraction of "
+                               f"ram_budget_gib={ram_budget_gib}"))
             continue
         rank_qubits = [b + n_local_bits + k for b in sorted_bits]
         windows.append(ExecutableWindow(
             start_step=s0, end_step=s1, rank_bits=sorted_bits,
             rank_qubits=rank_qubits, gates=gates, group_size=group_size,
-            estimated_ram_gib=est_ram))
+            estimated_ram_gib=est_ram, seg_len=seg_len, chunk_size=chunk_size))
     return windows, rejections
 
 
@@ -239,31 +276,40 @@ def execute_window(comm, rank: int, win: ExecutableWindow, src_chunks_dir,
         my_pattern = _rank_pattern(rank, sorted_bits)
         chunk_bytes = chunk_size * np.dtype(DTYPE).itemsize
 
+        seg_len = win.seg_len or chunk_size
+        seg_bytes = seg_len * np.dtype(DTYPE).itemsize
         for ci in range(n_chunks_per_rank):
             my_chunk = read_chunk(src_chunks_dir / chunk_filename(ci))
-            recvbuf = (np.empty(G * chunk_size, dtype=DTYPE)
-                       if sub_rank == 0 else None)
-            sub.Gather(np.ascontiguousarray(my_chunk), recvbuf, root=0)
-            if sub_rank == 0:
-                rows = recvbuf.reshape(G, chunk_size)
-                # reorder subrank-order rows into pattern-order
-                by_pattern = np.empty((G, chunk_size), dtype=DTYPE)
-                for sr in range(G):
-                    by_pattern[patterns[sr]] = rows[sr]
-                out_by_pattern = apply_window_to_group_buffer(
-                    by_pattern, sorted_bits, win.gates)
-                # back to subrank order for Scatter
-                sendbuf = np.empty(G * chunk_size, dtype=DTYPE)
-                send_rows = sendbuf.reshape(G, chunk_size)
-                for sr in range(G):
-                    send_rows[sr] = out_by_pattern[patterns[sr]]
-                metrics.gather_bytes += (G - 1) * chunk_bytes
-                metrics.scatter_bytes += (G - 1) * chunk_bytes
-                metrics.window_sendrecv_count += 2   # one Gather + one Scatter
-            else:
-                sendbuf = None
             my_new = np.empty(chunk_size, dtype=DTYPE)
-            sub.Scatter(sendbuf, my_new, root=0)
+            # Gather/apply/scatter in segments so the leader's resident memory
+            # stays within budget regardless of chunk size (gates act per
+            # offset, so segmenting is exact).
+            for a in range(0, chunk_size, seg_len):
+                b = min(a + seg_len, chunk_size)
+                slen = b - a
+                seg = np.ascontiguousarray(my_chunk[a:b])
+                recvbuf = (np.empty(G * slen, dtype=DTYPE)
+                           if sub_rank == 0 else None)
+                sub.Gather(seg, recvbuf, root=0)
+                if sub_rank == 0:
+                    rows = recvbuf.reshape(G, slen)
+                    by_pattern = np.empty((G, slen), dtype=DTYPE)
+                    for sr in range(G):
+                        by_pattern[patterns[sr]] = rows[sr]
+                    out_by_pattern = apply_window_to_group_buffer(
+                        by_pattern, sorted_bits, win.gates)
+                    sendbuf = np.empty(G * slen, dtype=DTYPE)
+                    send_rows = sendbuf.reshape(G, slen)
+                    for sr in range(G):
+                        send_rows[sr] = out_by_pattern[patterns[sr]]
+                    metrics.gather_bytes += (G - 1) * slen * np.dtype(DTYPE).itemsize
+                    metrics.scatter_bytes += (G - 1) * slen * np.dtype(DTYPE).itemsize
+                    metrics.window_sendrecv_count += 2   # one Gather + one Scatter
+                else:
+                    sendbuf = None
+                seg_new = np.empty(slen, dtype=DTYPE)
+                sub.Scatter(sendbuf, seg_new, root=0)
+                my_new[a:b] = seg_new
             write_chunk_atomic(dst_chunks_dir / chunk_filename(ci), my_new)
     finally:
         sub.Free()

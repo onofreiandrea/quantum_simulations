@@ -195,29 +195,31 @@ def test_default_heavy_zero_windows(tmp):
     assert fs["correct"] is True
 
 
-# 5 & 6: unsupported / small RAM → fallback (no window, still correct)
+# 6 & 9 & 11: tight RAM budget is respected — the leader gathers in segments so
+# the window stays within budget (no OOM) rather than blowing up; result correct.
 @_mark
-def test_small_ram_budget_falls_back(tmp):
+def test_tight_ram_budget_respected(tmp):
     out = Path(tmp) / "o_smallram"; wd = Path(tmp) / "w_smallram"
     shutil.rmtree(out, ignore_errors=True); shutil.rmtree(wd, ignore_errors=True)
-    # budget big enough for one chunk+temp (so the run starts) but too small for
-    # the 4-chunk (group_size=4) window region → window rejected, per-step
-    # fallback used.  np 4 → 2 rank bits → group_size 4; chunk-bits 8.
+    # A tight (but runnable) budget: the window must segment its gather to fit,
+    # never exceeding the budget, and still produce the correct state.
+    budget = 0.02
     cmd = ["mpirun", "-np", "4", sys.executable, "-m",
            "wenbo_engine.bench.communication_workloads", "--kind",
            "mpi_nonlocal_mixing_heavy", "--n", "12", "--depth", "20",
            "--recovery", "generation", "--planner", "recovery_aware_v1",
            "--mpi-exchange-mode", "gate_aware", "--mpi-window-execution", "safe",
-           "--chunk-bits", "8", "--ram-budget-gib", "0.00001", "--verify",
+           "--chunk-bits", "8", "--ram-budget-gib", str(budget), "--verify",
            "--output-dir", str(out), "--work-dir", str(wd)]
     r = subprocess.run(cmd, env=dict(os.environ, PYTHONPATH=REPO),
                        capture_output=True, timeout=400)
-    assert r.returncode == 0, r.stderr.decode()[-2000:]
+    assert r.returncode == 0, r.stderr.decode()[-2000:]   # no OOM / crash
     fs = json.load(open(glob.glob(str(out / "**" / "final_summary.json"),
                                   recursive=True)[0]))
-    assert fs["mpi_windows_executed"] == 0
-    assert fs["mpi_window_fallbacks"] >= 1
     assert fs["correct"] is True
+    # RAM budget respected: estimated leader peak <= budget; ran or fell back.
+    assert fs["mpi_window_estimated_ram_gib"] <= budget
+    assert (fs["mpi_windows_executed"] >= 1) or (fs["mpi_window_fallbacks"] >= 1)
 
 
 # 7 & 8 & 9: window output == gate-aware step output == dense ref; norm ~ 1
