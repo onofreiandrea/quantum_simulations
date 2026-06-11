@@ -38,12 +38,33 @@ from wenbo_engine.planner.stage_cost_model import (
     DEFAULT_COST_MODEL,
     load_cost_model,
     stage_cost,
+    recovery_aware_cost,
 )
 from wenbo_engine.planner.plan_serializer import (
     serialize_plan,
     deserialize_plan,
     plan_to_json,
+    serialize_recovery_aware_plan,
+    serialize_candidate_strategies,
+    recovery_aware_plan_to_json,
 )
+
+# ── Recovery-aware planner v1 ───────────────────────────────────────────
+from wenbo_engine.planner.stage_plan import StagePlan
+from wenbo_engine.planner.strategy_candidate import (
+    StrategyCandidate,
+    PlanContext,
+    enumerate_candidates,
+    estimate_candidate,
+)
+from wenbo_engine.planner.strategy_selector import select_strategy
+from wenbo_engine.planner.recovery_aware_planner import (
+    PLANNER_NAME as RECOVERY_AWARE_V1,
+    plan_recovery_aware,
+    build_plan_context,
+    selected_run_params,
+)
+from wenbo_engine.planner.cost_report import build_cost_report
 
 # ── Capacity planner ────────────────────────────────────────────────────
 from wenbo_engine.planner.capacity_planner import (
@@ -73,9 +94,25 @@ __all__ = [
     "DEFAULT_COST_MODEL",
     "load_cost_model",
     "stage_cost",
+    "recovery_aware_cost",
     "serialize_plan",
     "deserialize_plan",
     "plan_to_json",
+    # recovery-aware planner v1
+    "StagePlan",
+    "StrategyCandidate",
+    "PlanContext",
+    "enumerate_candidates",
+    "estimate_candidate",
+    "select_strategy",
+    "RECOVERY_AWARE_V1",
+    "plan_recovery_aware",
+    "build_plan_context",
+    "selected_run_params",
+    "build_cost_report",
+    "serialize_recovery_aware_plan",
+    "serialize_candidate_strategies",
+    "recovery_aware_plan_to_json",
     # capacity planner
     "BYTES_PER_AMP",
     "RECOVERY_MODES",

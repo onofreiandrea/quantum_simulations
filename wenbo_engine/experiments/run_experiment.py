@@ -170,6 +170,23 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
     n = circuit["number_of_qubits"]
     chunk_size = cfg.resolved_chunk_size(n)
 
+    # Recovery-aware planner v1: select the execution strategy on every rank
+    # (deterministic) and override the cfg execution params accordingly, so the
+    # selection flows into the run and into config.json.  No qubit reorder.
+    recovery_aware_plan = None
+    if getattr(cfg, "planner", None) == "recovery_aware_v1":
+        import math as _m
+        from wenbo_engine.planner import plan_recovery_aware, selected_run_params
+        recovery_aware_plan = plan_recovery_aware(
+            circuit, n=n, chunk_bits=int(_m.log2(chunk_size)),
+            num_ranks=n_ranks, recovery=cfg.resolved_recovery(),
+            compute_unit_min_gates=getattr(cfg, "compute_unit_min_gates", 4))
+        _rp = selected_run_params(recovery_aware_plan)
+        cfg.storage_layout = _rp["storage_layout"]
+        cfg.execution_mode = _rp["execution_mode"]
+        cfg.extent_io_mode = _rp["extent_io_mode"]
+        cfg.compute_unit_min_gates = _rp["compute_unit_min_gates"]
+
     run_id = _make_run_id(cfg, circuit)
     if comm is not None:
         run_id = comm.bcast(run_id, root=0)
@@ -200,6 +217,24 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
                 pass
         plan = compile_plan(circuit, chunk_size, n_ranks)
         (run_dir / "plan.json").write_text(json.dumps(plan, indent=2))
+
+        # Recovery-aware planner v1: richer plan.json + candidate table +
+        # predicted cost report (actual metrics are filled by the bench's
+        # measured path; here only the prediction is available).
+        if recovery_aware_plan is not None:
+            from wenbo_engine.planner import (
+                serialize_recovery_aware_plan, serialize_candidate_strategies,
+                build_cost_report,
+            )
+            (run_dir / "plan.json").write_text(json.dumps(
+                serialize_recovery_aware_plan(recovery_aware_plan),
+                indent=2, default=str))
+            (run_dir / "candidate_strategies.json").write_text(json.dumps(
+                serialize_candidate_strategies(recovery_aware_plan),
+                indent=2, default=str))
+            (run_dir / "cost_report.json").write_text(json.dumps(
+                build_cost_report(recovery_aware_plan, {}), indent=2,
+                default=str))
 
         # Optimizer-v2 ablation report (deterministic plan metrics for all
         # modes).  Always written so the data-movement comparison is
@@ -270,7 +305,7 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
             circuit_clifford_stats,
         )
         clifford = circuit_clifford_stats(circuit)
-        summary_mod.write_summary(run_dir, extra={
+        _extra = {
             "run_id": run_id,
             "runner": cfg.runner,
             "n_qubits": n,
@@ -288,7 +323,12 @@ def run_experiment(cfg: ExperimentConfig, *, run_id: str | None = None,
             "non_clifford_gate_types": clifford["non_clifford_gate_types"],
             "wall_sec": round(wall, 6),
             "final_norm": norm,
-        })
+        }
+        if recovery_aware_plan is not None:
+            _extra["planner"] = "recovery_aware_v1"
+            _extra["selected_strategy"] = \
+                recovery_aware_plan["decision"]["selected_strategy"]["name"]
+        summary_mod.write_summary(run_dir, extra=_extra)
     if comm is not None:
         comm.Barrier()
     return run_dir

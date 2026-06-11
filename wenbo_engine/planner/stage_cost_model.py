@@ -44,6 +44,18 @@ DEFAULT_COST_MODEL: dict = {
     # probability a stage must be recomputed due to a failure (drives the
     # recompute-if-failure term).  0 by default → that term is 0.
     "failure_prob": 0.0,
+    # ── recovery-aware planner v1 extensions ────────────────────────────
+    # Durable checkpoint write bandwidth (remote object store / NFS), much
+    # slower than local NVMe.  Drives durable_checkpoint_cost.
+    "durable_write_gbps": 0.5,
+    # Per-chunk seek+read overhead of the direct extent-slice I/O path
+    # (seek into a packed extent file instead of opening a chunk file).
+    "direct_extent_seek_ms": 0.01,
+    # Per-generation failure probability used ONLY by the recovery-aware
+    # expected_recomputation_cost term (kept separate from ``failure_prob``
+    # so optimizer-v2's stage_cost is unaffected).  Small but non-zero so the
+    # term is represented; smaller committed generations ⇒ less work at risk.
+    "planner_failure_prob": 0.01,
 }
 
 # Flat cost-model keys we read; everything else in a calibration file is
@@ -51,6 +63,7 @@ DEFAULT_COST_MODEL: dict = {
 _REQUIRED_KEYS = (
     "nvme_read_gbps", "nvme_write_gbps", "fsync_ms", "rename_ms",
     "mpi_sendrecv_gbps", "mpi_barrier_ms", "kernel_gbps", "failure_prob",
+    "durable_write_gbps", "direct_extent_seek_ms", "planner_failure_prob",
 )
 
 _GB = 1e9
@@ -134,4 +147,80 @@ def stage_cost(*, bytes_read: int, bytes_written: int, mpi_bytes: int,
         "estimated_commit": commit,
         "estimated_recompute_if_failure": recompute,
         "total": total,
+    }
+
+
+# ── recovery-aware cost model (planner v1) ──────────────────────────────
+
+def _nvme_rw_avg_gbps(model: dict) -> float:
+    return (model["nvme_read_gbps"] + model["nvme_write_gbps"]) / 2.0
+
+
+def recovery_aware_cost(*, bytes_read: int, bytes_written: int,
+                        mpi_bytes: int, sendrecv_count: int,
+                        kernel_bytes: int, commits: int,
+                        extent_materialize_bytes: int = 0,
+                        direct_extent_chunks: int = 0,
+                        layout_materialize_bytes: int = 0,
+                        durable_bytes: int = 0,
+                        recompute_bytes: int = 0,
+                        model: dict) -> dict:
+    """Recovery-aware cost breakdown (seconds) with the planner-v1 terms.
+
+    ``total_cost = nvme_read_write_cost + mpi_exchange_cost + kernel_cost
+                 + extent_materialization_cost + direct_extent_io_cost
+                 + layout_materialization_cost + commit_cost
+                 + durable_checkpoint_cost + expected_recomputation_cost``
+
+    The terms are mutually exclusive physical contributions:
+
+    * ``nvme_read_write_cost`` — the unavoidable logical state read+write
+      passes (fewer for compute-unit fusion).
+    * ``extent_materialization_cost`` — the EXTRA temp-chunk round trip the
+      materialize extent-I/O path pays (unpack extents→chunks, repack
+      chunks→extents).  Zero for chunks layout and for direct extent I/O.
+    * ``direct_extent_io_cost`` — the small seek overhead of the direct
+      extent-slice path (replaces the materialize round trip).  Zero unless
+      direct extent I/O is used.
+    * ``layout_materialization_cost`` — one-time cost of converting the input
+      state into the strategy's storage layout before stage 0 (zero for a
+      fresh run written in-layout; counted so rule 4 is never free).
+    * ``durable_checkpoint_cost`` — promoting committed generations to durable
+      storage (zero unless a durable policy is active).
+    * ``expected_recomputation_cost`` — failure-probability-weighted work at
+      risk between commits (smaller/more-frequent commits ⇒ less at risk).
+    """
+    rd = _read_sec(bytes_read, model)
+    wr = _write_sec(bytes_written, model)
+    nvme_rw = rd + wr
+    mpi = _mpi_sec(mpi_bytes, model)
+    if mpi_bytes or sendrecv_count:
+        mpi += model["mpi_barrier_ms"] * _MS
+    kernel = kernel_bytes / (model["kernel_gbps"] * _GB) if kernel_bytes else 0.0
+
+    avg = _nvme_rw_avg_gbps(model)
+    extent_mat = (extent_materialize_bytes / (avg * _GB)
+                  if extent_materialize_bytes else 0.0)
+    direct_io = direct_extent_chunks * model["direct_extent_seek_ms"] * _MS
+    layout_mat = (layout_materialize_bytes / (avg * _GB)
+                  if layout_materialize_bytes else 0.0)
+    commit = commits * (model["fsync_ms"] + model["rename_ms"]) * _MS
+    durable = (durable_bytes / (model["durable_write_gbps"] * _GB)
+               if durable_bytes else 0.0)
+    recompute = model["planner_failure_prob"] * (
+        recompute_bytes / (avg * _GB) if recompute_bytes else 0.0)
+
+    total = (nvme_rw + mpi + kernel + extent_mat + direct_io + layout_mat
+             + commit + durable + recompute)
+    return {
+        "nvme_read_write_cost": nvme_rw,
+        "mpi_exchange_cost": mpi,
+        "kernel_cost": kernel,
+        "extent_materialization_cost": extent_mat,
+        "direct_extent_io_cost": direct_io,
+        "layout_materialization_cost": layout_mat,
+        "commit_cost": commit,
+        "durable_checkpoint_cost": durable,
+        "expected_recomputation_cost": recompute,
+        "estimated_total_cost": total,
     }

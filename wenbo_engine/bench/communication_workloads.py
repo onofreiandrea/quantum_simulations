@@ -808,7 +808,27 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
     # its execution).  The deterministic ablation report is written to the
     # artifact bundle regardless.  ``current`` / None are behavior-preserving.
     planner_perm = None
-    if planner is not None and planner != "current":
+    recovery_aware_plan = None
+    if planner == "recovery_aware_v1":
+        # Recovery-aware planner v1: evaluate candidate strategies and SELECT
+        # the run's (storage_layout, execution_mode, extent_io_mode,
+        # mpi_exchange_mode, compute_unit_min_gates).  Deterministic, so every
+        # rank computes the same selection independently and runs consistently.
+        # It does NOT relabel qubits (no reorder → MPI stress is preserved).
+        from wenbo_engine.planner import plan_recovery_aware, selected_run_params
+        recovery_aware_plan = plan_recovery_aware(
+            cd, n=n, chunk_bits=chunk_bits, num_ranks=num_ranks,
+            recovery=recovery, compute_unit_min_gates=compute_unit_min_gates)
+        _rp = selected_run_params(recovery_aware_plan)
+        storage_layout = _rp["storage_layout"]
+        execution_mode = _rp["execution_mode"]
+        extent_io_mode = _rp["extent_io_mode"]
+        mpi_exchange_mode = _rp["mpi_exchange_mode"]
+        compute_unit_min_gates = _rp["compute_unit_min_gates"]
+        if rank == 0:
+            log.info("  recovery_aware_v1 selected: %s",
+                     recovery_aware_plan["decision"]["selected_strategy"]["name"])
+    elif planner is not None and planner != "current":
         from wenbo_engine.planner import ABLATION_MODES
         from wenbo_engine.planner.placement_planner import (
             plan_placement, apply_placement,
@@ -955,6 +975,37 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
     if durable_promotion is not None:
         result["durable_promotion"] = durable_promotion
 
+    # Recovery-aware planner v1: compare the SELECTED candidate's predicted
+    # metrics against the measured run, and attach the decision + cost report.
+    if recovery_aware_plan is not None:
+        from wenbo_engine.planner import build_cost_report
+        actual = {
+            "bytes_read": (overlay_metrics.get("overlay_bytes_read")
+                           or aggregate["bytes_read"]),
+            "bytes_written": (overlay_metrics.get("overlay_bytes_written")
+                              or aggregate["bytes_written"]),
+            "read_ops": aggregate["read_ops"],
+            "write_ops": aggregate["write_ops"],
+            "temporary_chunk_files_created": aggregate["write_ops"],
+            "mpi_bytes_sent": aggregate["mpi_bytes_sent"],
+            "sendrecv_count": aggregate["sendrecv_count"],
+            "kernel_time": aggregate["kernel_time"],
+            "commit_count": _count_commit_records(work_dir),
+            "wall_time": aggregate["stage_time"],
+            "work_time": (aggregate["read_sec"] + aggregate["write_sec"]
+                          + aggregate["kernel_time"]
+                          + aggregate["mpi_sendrecv_time"]),
+        }
+        cost_report = build_cost_report(recovery_aware_plan, actual)
+        result["planner_mode"] = "recovery_aware_v1"
+        result["selected_strategy"] = \
+            recovery_aware_plan["decision"]["selected_strategy"]["name"]
+        result["recovery_aware"] = {
+            "plan": recovery_aware_plan,
+            "actual_cost_after_run": actual,
+            "cost_report": cost_report,
+        }
+
     if output_dir is not None:
         write_artifacts(output_dir, result, cd, work_dir=work_dir)
 
@@ -1008,6 +1059,13 @@ def _wal_present(work_dir: str | Path | None) -> bool:
     if work_dir is None:
         return False
     return bool(list(Path(work_dir).glob("**/wal.json")))
+
+
+def _count_commit_records(work_dir: str | Path | None) -> int:
+    """Count global commit records written (one per committed generation)."""
+    if work_dir is None:
+        return 0
+    return len(list(Path(work_dir).glob("**/commits/commit_*.json")))
 
 
 def _recovery_events(work_dir: str | Path | None, recovery: str) -> dict:
@@ -1142,6 +1200,20 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         },
     }, indent=2))
 
+    # Recovery-aware planner v1 artifacts: a richer plan.json (overwriting the
+    # simple one above), the candidate table, and the predicted-vs-actual report.
+    ra = result.get("recovery_aware")
+    if ra is not None:
+        from wenbo_engine.planner import (
+            serialize_recovery_aware_plan, serialize_candidate_strategies,
+        )
+        (d / "plan.json").write_text(json.dumps(
+            serialize_recovery_aware_plan(ra["plan"]), indent=2, default=str))
+        (d / "candidate_strategies.json").write_text(json.dumps(
+            serialize_candidate_strategies(ra["plan"]), indent=2, default=str))
+        (d / "cost_report.json").write_text(json.dumps(
+            ra["cost_report"], indent=2, default=str))
+
     # cost_model.json — calibration is the observability harness's job; we
     # only guarantee the artifact exists (honest "not calibrated here").
     (d / "cost_model.json").write_text(json.dumps({"calibrated": False}, indent=2))
@@ -1248,6 +1320,24 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         "non_clifford_gate_types": result.get("non_clifford_gate_types"),
         "metrics_are_measured": True,
     }
+    # Recovery-aware planner v1 decision fields in final_summary.
+    _ra = result.get("recovery_aware")
+    if _ra is not None:
+        _dec = _ra["plan"]["decision"]
+        _cr = _ra["cost_report"]
+        required["planner"] = "recovery_aware_v1"
+        required["planner_mode"] = "recovery_aware_v1"
+        required["selected_strategy"] = _dec["selected_strategy"]["name"]
+        required["rejected_candidates"] = [r["name"] for r in
+                                           _dec["rejected_candidates"]]
+        required["reason_for_selection"] = _dec["reason_for_selection"]
+        required["predicted_cost_by_candidate"] = \
+            _dec["predicted_cost_by_candidate"]
+        required["actual_cost_after_run"] = _ra["actual_cost_after_run"]
+        required["prediction_error_pct"] = {
+            k: v["prediction_error_pct"] for k, v in _cr["metrics"].items()
+        }
+
     _om = result.get("overlay_metrics") or {}
     for _kk in ("compute_unit_min_gates", "compute_units_executed",
                 "compute_unit_fallbacks", "avg_gates_per_compute_unit",
@@ -1319,11 +1409,14 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--fault-mode", type=str, default="os_exit",
                     help="crash mode: os_exit (default) | exception")
     ap.add_argument("--planner", default=None,
-                    help="Optimizer-v2 ablation mode: current | "
+                    help="Planner mode. Optimizer-v2 ablation: current | "
                          "current_static_reorder | stage_v2 | "
-                         "stage_v2_fusion | stage_v2_placement_fusion. "
-                         "Writes ablation_report.json and (for reorder/"
-                         "placement modes) applies the static transform.")
+                         "stage_v2_fusion | stage_v2_placement_fusion "
+                         "(writes ablation_report.json; reorder/placement modes "
+                         "apply a static transform).  Or recovery_aware_v1: "
+                         "evaluate candidate strategies, select a safe one, and "
+                         "write plan.json / candidate_strategies.json / "
+                         "cost_report.json (predicted vs actual).")
     ap.add_argument("--mpi-exchange-mode", dest="mpi_exchange_mode",
                     choices=["naive", "gate_aware"], default="naive",
                     help="MPI-nonlocal exchange path: naive (one Sendrecv per "
