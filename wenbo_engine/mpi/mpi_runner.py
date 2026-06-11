@@ -68,6 +68,28 @@ def _reset_ram_budgets(overlay_budget_chunks: int = 0,
     _RAM["remote_peak_bytes"] = 0
 
 
+# ── per-run MPI-nonlocal telemetry (per-process; aggregated at run end) ──
+# Surfaces remote-cache reuse + the diagonal-vs-mixing split so a phase-heavy
+# (diagonal) run can never be mistaken for true MPI stress.  The remote cache
+# still lives only inside one _apply_step (scope = "step").
+_MPI_TELE = {
+    "cache_hits": 0, "cache_misses": 0,
+    "diagonal_applied": 0, "exchange_applied": 0, "requires_remote_applied": 0,
+    "mpi_steps": 0, "gates_per_step": [],
+    "total_fetches": 0, "adjacent_refetch": 0,
+    "all_fetched": set(), "prev_fetch_set": set(),
+}
+
+
+def _reset_mpi_telemetry() -> None:
+    _MPI_TELE.update(cache_hits=0, cache_misses=0, diagonal_applied=0,
+                     exchange_applied=0, requires_remote_applied=0,
+                     mpi_steps=0, gates_per_step=[], total_fetches=0,
+                     adjacent_refetch=0)
+    _MPI_TELE["all_fetched"] = set()
+    _MPI_TELE["prev_fetch_set"] = set()
+
+
 # fraction of the RAM budget reserved for the overlay working set (the rest is
 # headroom for MPI send/recv buffers + remote cache + python/runtime overhead).
 _OVERLAY_BUDGET_FRACTION = 0.75
@@ -161,6 +183,53 @@ def _write_kernel_metrics(work_dir, comm) -> None:
     }
     try:
         (Path(work_dir) / "kernel_metrics.json").write_text(json.dumps(out))
+    except OSError:
+        pass
+
+
+def _finalize_mpi_telemetry(work_dir, comm) -> None:
+    """Aggregate MPI-nonlocal telemetry across ranks; write (rank 0) the JSON.
+
+    Additive counters are summed across ranks; ``distinct_remote_chunks_per_rank``
+    is the max per-rank distinct count (representative, ranks are symmetric).
+    The remote cache scope is and stays ``"step"``.
+    """
+    t = _MPI_TELE
+    distinct_local = len(t["all_fetched"])
+    if comm is not None and comm.Get_size() > 1:
+        s = lambda x: comm.allreduce(int(x), op=MPI.SUM)
+        hits = s(t["cache_hits"]); misses = s(t["cache_misses"])
+        diag = s(t["diagonal_applied"]); exch = s(t["exchange_applied"])
+        req = s(t["requires_remote_applied"])
+        total_fetch = s(t["total_fetches"]); adj = s(t["adjacent_refetch"])
+        distinct = comm.allreduce(distinct_local, op=MPI.MAX)
+    else:
+        hits, misses = t["cache_hits"], t["cache_misses"]
+        diag, exch, req = (t["diagonal_applied"], t["exchange_applied"],
+                           t["requires_remote_applied"])
+        total_fetch, adj, distinct = (t["total_fetches"], t["adjacent_refetch"],
+                                      distinct_local)
+    if comm is not None and comm.Get_rank() != 0:
+        return
+    denom = hits + misses
+    out = {
+        "remote_buffer_cache_hits": hits,
+        "remote_buffer_cache_misses": misses,
+        "remote_buffer_cache_hit_rate": (round(hits / denom, 4) if denom else None),
+        "distinct_remote_chunks_per_rank": distinct,
+        "repeated_remote_chunk_fetches": max(0, total_fetch - distinct),
+        "repeated_remote_chunk_fetches_adjacent_steps": adj,
+        "mpi_steps": t["mpi_steps"],
+        "mpi_gates_per_step": list(t["gates_per_step"]),
+        "remote_cache_scope": "step",
+        # diagonal-vs-mixing application counts (across ranks): make it
+        # impossible to confuse skipped diagonal MPI with true MPI stress.
+        "diagonal_mpi_applications": diag,
+        "exchange_mpi_applications": exch,
+        "requires_remote_amplitudes_applications": req,
+    }
+    try:
+        (Path(work_dir) / "mpi_telemetry.json").write_text(json.dumps(out))
     except OSError:
         pass
 
@@ -913,34 +982,81 @@ def _apply_step(comm: MPI.Comm, rank: int, n_local_bits: int,
     _pipeline_local_chunks(src_dir, dst_dir, n_chunks_per_rank,
                            local_ops, buffer_depth, affected)
 
-    # Phase 2: MPI-nonlocal gates (update dst in-place)
-    if mpi_exchange_mode == "gate_aware" and mpi_nonlocal_ops:
-        # Batch per-partner exchanges + reuse received remote chunks.  The
-        # per-pair kernel math is identical to the naive path, so the final
-        # state is unchanged; only the number/size of Sendrecv calls differ.
-        # Gates that don't fit the batched fast path fall back to naive.
-        from wenbo_engine.mpi.exchange_planner import plan_stage
-        from wenbo_engine.mpi.exchange_batch import (
-            apply_stage_gate_aware, default_batch_chunks,
+    # Phase 2: MPI-nonlocal gates (update dst in-place).
+    if mpi_nonlocal_ops:
+        from wenbo_engine.mpi.diagonal_nonlocal import (
+            classify_nonlocal_gate, apply_diagonal_nonlocal_chunk,
         )
-        from wenbo_engine.mpi.remote_buffer_cache import RemoteBufferCache
-        plan = plan_stage(mpi_nonlocal_ops, rank, k, n_local_bits,
-                          n_chunks_per_rank)
-        cache = RemoteBufferCache(max_bytes=_RAM["remote_buffer_max_bytes"])
-        fallback = apply_stage_gate_aware(
-            comm, plan, dst_dir, chunk_size,
-            default_batch_chunks(chunk_size), cache)
-        if cache.peak_bytes > _RAM["remote_peak_bytes"]:
-            _RAM["remote_peak_bytes"] = cache.peak_bytes
-        cache.clear()
-        for ge in fallback:
-            _apply_mpi_gate(comm, rank, n_local_bits, dst_dir,
-                            n_chunks_per_rank, chunk_size, k, ge.qs, ge.U)
-    else:
+        from wenbo_engine.mpi.exchange_planner import plan_stage
+
+        _MPI_TELE["mpi_steps"] += 1
+        _MPI_TELE["gates_per_step"].append(len(mpi_nonlocal_ops))
+
+        # Split: diagonal MPI gates apply locally (no Sendrecv); the rest
+        # (true-mixing / permutation) keep the exchange path.  Gates in a
+        # levelized step are on disjoint qubits, so the split commutes.
+        diag_ops, exch_ops = [], []
         for qs, U in mpi_nonlocal_ops:
-            _apply_mpi_gate(comm, rank, n_local_bits,
-                            dst_dir, n_chunks_per_rank, chunk_size, k,
-                            qs, U)
+            kind, requires_remote = classify_nonlocal_gate(U)
+            if kind == "diagonal":
+                diag_ops.append((qs, U))
+                _MPI_TELE["diagonal_applied"] += 1
+            else:
+                exch_ops.append((qs, U))
+                _MPI_TELE["exchange_applied"] += 1
+                if requires_remote:
+                    _MPI_TELE["requires_remote_applied"] += 1
+
+        # Diagonal fast path: phase each dst chunk locally via global indices.
+        if diag_ops:
+            for ci in range(n_chunks_per_rank):
+                cpath = dst_dir / "chunks" / chunk_filename(ci)
+                data = read_chunk(cpath)
+                for qs, U in diag_ops:
+                    apply_diagonal_nonlocal_chunk(data, ci, qs, U, rank, k,
+                                                  n_local_bits)
+                write_chunk_atomic(cpath, data)
+
+        # Telemetry: distinct / repeated / adjacent remote-chunk fetches that
+        # the EXCHANGE path (after diagonal removal) actually needs this step.
+        if exch_ops:
+            fset = set()
+            for ge in plan_stage(exch_ops, rank, k, n_local_bits,
+                                 n_chunks_per_rank):
+                if ge.batchable:
+                    for (_lci, rci) in ge.chunk_pairs:
+                        fset.add((ge.partner_rank, rci))
+            _MPI_TELE["total_fetches"] += len(fset)
+            _MPI_TELE["adjacent_refetch"] += len(fset & _MPI_TELE["prev_fetch_set"])
+            _MPI_TELE["all_fetched"].update(fset)
+            _MPI_TELE["prev_fetch_set"] = fset
+        else:
+            _MPI_TELE["prev_fetch_set"] = set()
+
+        # Exchange the remaining (non-diagonal) MPI gates — unchanged path.
+        if mpi_exchange_mode == "gate_aware" and exch_ops:
+            from wenbo_engine.mpi.exchange_batch import (
+                apply_stage_gate_aware, default_batch_chunks,
+            )
+            from wenbo_engine.mpi.remote_buffer_cache import RemoteBufferCache
+            plan = plan_stage(exch_ops, rank, k, n_local_bits, n_chunks_per_rank)
+            cache = RemoteBufferCache(max_bytes=_RAM["remote_buffer_max_bytes"])
+            fallback = apply_stage_gate_aware(
+                comm, plan, dst_dir, chunk_size,
+                default_batch_chunks(chunk_size), cache)
+            if cache.peak_bytes > _RAM["remote_peak_bytes"]:
+                _RAM["remote_peak_bytes"] = cache.peak_bytes
+            _MPI_TELE["cache_hits"] += cache.hits
+            _MPI_TELE["cache_misses"] += cache.misses
+            cache.clear()
+            for ge in fallback:
+                _apply_mpi_gate(comm, rank, n_local_bits, dst_dir,
+                                n_chunks_per_rank, chunk_size, k, ge.qs, ge.U)
+        elif exch_ops:
+            for qs, U in exch_ops:
+                _apply_mpi_gate(comm, rank, n_local_bits,
+                                dst_dir, n_chunks_per_rank, chunk_size, k,
+                                qs, U)
 
     comm.Barrier()
 
@@ -998,6 +1114,7 @@ def run(
     # rank selects identically.
     from wenbo_engine.kernel import backend as _kbackend
     _kbackend.set_backend(kernel_backend)
+    _reset_mpi_telemetry()
 
     # RAM-aware execution control: resolve per-rank overlay + remote-cache
     # budgets and FAIL EARLY (before any large allocation) if a single chunk +
@@ -1019,6 +1136,7 @@ def run(
                                  extent_io_mode=extent_io_mode)
         _write_ram_metrics(work_dir, comm, ram_meta)
         _write_kernel_metrics(work_dir, comm)
+        _finalize_mpi_telemetry(work_dir, comm)
         return result
     # none / wal share the double-buffer path; WAL writes are gated below.
     use_wal = (recovery == "wal")
@@ -1160,6 +1278,7 @@ def run(
 
     _write_ram_metrics(work_dir, comm, ram_meta)
     _write_kernel_metrics(work_dir, comm)
+    _finalize_mpi_telemetry(work_dir, comm)
     return src_dir  # committed state directory
 
 

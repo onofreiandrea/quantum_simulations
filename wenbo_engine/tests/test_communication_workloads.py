@@ -392,3 +392,16 @@ def test_generation_light_after_heavy_no_stale(tmp_path):
     ev = json.loads((adir / "recovery_events.json").read_text())
     assert ev["recovery_mode"] == "generation"
     assert ev["source_of_truth"] == "global_commit_record"
+
+
+# ── diagonal/mixing MPI workloads: locality + non-stabilizer ────────────
+
+@pytest.mark.parametrize("kind", ["mpi_nonlocal_phase_heavy",
+                                  "mpi_nonlocal_mixing_heavy"])
+def test_mpi_phase_mixing_workloads_are_mpi_nonlocal_and_nonstabilizer(kind):
+    from wenbo_engine.bench.communication_workloads import (
+        build_circuit, classify_circuit, circuit_clifford_stats)
+    cd = build_circuit(kind, 24, 20, 20, 4, 42)
+    info = classify_circuit(cd, 20, 4)
+    assert info["mpi_nonlocal_gate_count"] > 0          # genuinely MPI-nonlocal
+    assert circuit_clifford_stats(cd)["is_stabilizer"] is False

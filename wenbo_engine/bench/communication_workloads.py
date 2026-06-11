@@ -98,6 +98,8 @@ INTENDED_LOCALITY = {
     "communication_light": "local",
     "rank_nonlocal_heavy": "rank_nonlocal",
     "mpi_nonlocal_heavy": "mpi_nonlocal",
+    "mpi_nonlocal_phase_heavy": "mpi_nonlocal",
+    "mpi_nonlocal_mixing_heavy": "mpi_nonlocal",
     "mixed_staged": "mixed",
 }
 
@@ -310,6 +312,66 @@ def mpi_nonlocal_heavy(n: int, depth: int, chunk_bits: int,
     return {"number_of_qubits": n, "gates": gates}
 
 
+def mpi_nonlocal_phase_heavy(n: int, depth: int, chunk_bits: int,
+                             num_ranks: int, seed: int = 42) -> dict:
+    """MPI-nonlocal gates that are all DIAGONAL (controlled phases / phases).
+
+    Every gate touches a rank bit but is diagonal — controlled-phase on a
+    (rank-bit, local) pair, or a 1-qubit phase on a rank bit — so it needs NO
+    remote-amplitude exchange.  Designed to benefit strongly from the diagonal
+    fast path (sendrecv → 0).  Non-stabilizer via CR(k>=3) controlled phases
+    and RZ(theta) rotations on rank bits.
+    """
+    k = chunk_bits
+    p = _rank_bits(num_ranks)
+    if p < 1 or k < 1 or n - p < k:
+        raise ValueError(f"bad layout: n={n} chunk_bits={k} p={p}")
+    rng = np.random.RandomState(seed)
+    gates: list[dict] = []
+    for i in range(depth):
+        rank_q = _pick(rng, n - p, n)
+        local_q = _pick(rng, 0, k)
+        if i % _NONCLIFFORD_EVERY == 0:
+            # non-Clifford diagonal controlled phase on (rank, local)
+            gates.append({"qubits": [rank_q, local_q], "gate": "CR",
+                          "params": {"k": int(rng.choice([3, 4, 5]))}})
+        elif i % 3 == 1:
+            gates.append({"qubits": [rank_q, local_q], "gate": "CZ"})  # diagonal
+        else:
+            # diagonal 1-qubit phase on the rank bit (non-Clifford theta)
+            gates.append({"qubits": [rank_q], "gate": "RZ",
+                          "params": {"theta": float(rng.uniform(0.15, np.pi / 2 - 0.15))}})
+    return {"number_of_qubits": n, "gates": gates}
+
+
+def mpi_nonlocal_mixing_heavy(n: int, depth: int, chunk_bits: int,
+                              num_ranks: int, seed: int = 42) -> dict:
+    """MPI-nonlocal gates that TRULY MIX across the rank boundary.
+
+    Every gate is a 1-qubit gate on a rank bit that is NOT diagonal (H / RX /
+    RY), so it mixes amplitudes between partner ranks and MUST exchange — the
+    diagonal fast path never applies here.  Non-stabilizer via RX/RY(theta).
+    """
+    k = chunk_bits
+    p = _rank_bits(num_ranks)
+    if p < 1 or n - p < k:
+        raise ValueError(f"bad layout: n={n} chunk_bits={k} p={p}")
+    rng = np.random.RandomState(seed)
+    gates: list[dict] = []
+    for i in range(depth):
+        rank_q = _pick(rng, n - p, n)
+        m = i % 3
+        if m == 0:
+            gates.append({"qubits": [rank_q], "gate": "RX",
+                          "params": {"theta": float(rng.uniform(0.15, np.pi / 2 - 0.15))}})
+        elif m == 1:
+            gates.append({"qubits": [rank_q], "gate": "RY",
+                          "params": {"theta": float(rng.uniform(0.15, np.pi / 2 - 0.15))}})
+        else:
+            gates.append({"qubits": [rank_q], "gate": "H"})   # true mixing (Clifford)
+    return {"number_of_qubits": n, "gates": gates}
+
+
 def mixed_staged(n: int, depth: int, chunk_bits: int,
                  num_ranks: int, seed: int = 42) -> dict:
     """Phased workload: local block, then rank-nonlocal, then MPI-nonlocal.
@@ -337,6 +399,8 @@ GENERATORS = {
     "communication_light": communication_light,
     "rank_nonlocal_heavy": rank_nonlocal_heavy,
     "mpi_nonlocal_heavy": mpi_nonlocal_heavy,
+    "mpi_nonlocal_phase_heavy": mpi_nonlocal_phase_heavy,
+    "mpi_nonlocal_mixing_heavy": mpi_nonlocal_mixing_heavy,
     "mixed_staged": mixed_staged,
 }
 
@@ -350,6 +414,10 @@ def build_circuit(kind: str, n: int, depth: int, chunk_bits: int,
         return rank_nonlocal_heavy(n, depth, chunk_bits, seed, num_ranks=num_ranks)
     if kind == "mpi_nonlocal_heavy":
         return mpi_nonlocal_heavy(n, depth, chunk_bits, num_ranks, seed)
+    if kind == "mpi_nonlocal_phase_heavy":
+        return mpi_nonlocal_phase_heavy(n, depth, chunk_bits, num_ranks, seed)
+    if kind == "mpi_nonlocal_mixing_heavy":
+        return mpi_nonlocal_mixing_heavy(n, depth, chunk_bits, num_ranks, seed)
     if kind == "mixed_staged":
         return mixed_staged(n, depth, chunk_bits, num_ranks, seed)
     raise ValueError(f"unknown workload kind: {kind!r} (choices: {list(GENERATORS)})")
@@ -494,6 +562,43 @@ def _layout(n: int, chunk_bits: int, num_ranks: int) -> tuple[int, int, int]:
             f"invalid layout: n - chunk_bits - log2(num_ranks) = "
             f"{n_local_bits} < 0 (n={n}, chunk_bits={k}, num_ranks={num_ranks})")
     return k, p, n_local_bits
+
+
+def classify_mpi_gates(circuit_dict: dict, chunk_bits: int,
+                       num_ranks: int) -> dict:
+    """Classify the circuit's MPI-nonlocal gates: diagonal / mixing / permutation.
+
+    Diagonal MPI gates need no remote-amplitude exchange (the diagonal fast
+    path applies them locally); true-mixing and permutation gates do.  Lets
+    final_summary distinguish skipped diagonal MPI from genuine MPI stress.
+    """
+    from wenbo_engine.kernel import gates as _g
+    from wenbo_engine.mpi.diagonal_nonlocal import classify_nonlocal_gate
+    k, p, n_local_bits = _layout(circuit_dict["number_of_qubits"]
+                                 if "number_of_qubits" in circuit_dict else 0,
+                                 chunk_bits, num_ranks)
+    diag = mixing = perm = req = 0
+    for gt in circuit_dict["gates"]:
+        qs = gt["qubits"]
+        if classify_gate(qs, k, n_local_bits) != "mpi_nonlocal":
+            continue
+        U = _g.gate_matrix(gt["gate"], gt.get("params", {}))
+        kind, requires_remote = classify_nonlocal_gate(U)
+        if kind == "diagonal":
+            diag += 1
+        elif kind == "permutation":
+            perm += 1
+        else:
+            mixing += 1
+        if requires_remote:
+            req += 1
+    return {
+        "diagonal_mpi_nonlocal_gate_count": diag,
+        "true_mixing_mpi_nonlocal_gate_count": mixing,
+        "permutation_mpi_nonlocal_gate_count": perm,
+        "requires_remote_amplitudes_gate_count": req,
+        "skipped_mpi_exchange_gate_count": diag,   # diagonal gates skip exchange
+    }
 
 
 def classify_circuit(circuit_dict: dict, chunk_bits: int,
@@ -945,6 +1050,14 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         except (OSError, ValueError):
             kernel_metrics = {}
 
+    mpi_telemetry = {}
+    mt_path = Path(work_dir) / "mpi_telemetry.json"
+    if mt_path.exists():
+        try:
+            mpi_telemetry = json.loads(mt_path.read_text())
+        except (OSError, ValueError):
+            mpi_telemetry = {}
+
     ram_metrics = {}
     rm_path = Path(work_dir) / "ram_metrics.json"
     if rm_path.exists():
@@ -979,6 +1092,7 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
 
     aggregate = _aggregate(all_metrics)
     runner_cls = runner_classification(cd, chunk_bits, num_ranks)
+    mpi_gate_classes = classify_mpi_gates(cd, chunk_bits, num_ranks)
     static = classify_circuit(cd, chunk_bits, num_ranks)
     clifford = circuit_clifford_stats(cd)
 
@@ -1014,6 +1128,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         "overlay_metrics": overlay_metrics,
         "ram_metrics": ram_metrics,
         "kernel_metrics": kernel_metrics,
+        "mpi_telemetry": mpi_telemetry,
+        "mpi_gate_classes": mpi_gate_classes,
         "kernel_backend_requested": kernel_backend,
         "auto_chunk_bits_enabled": bool(auto_chunk_bits),
         "intended_locality": INTENDED_LOCALITY.get(kind, "unknown"),
@@ -1464,6 +1580,26 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
     required["numba_compile_time"] = _km.get("numba_compile_time")
     required["backend_fallback_reason"] = _km.get("backend_fallback_reason")
     required["kernel_time"] = agg["kernel_time"]
+
+    # ── MPI-nonlocal gate classification (analytic, per-circuit) ──
+    _mgc = result.get("mpi_gate_classes") or {}
+    for _kk in ("diagonal_mpi_nonlocal_gate_count",
+                "true_mixing_mpi_nonlocal_gate_count",
+                "permutation_mpi_nonlocal_gate_count",
+                "requires_remote_amplitudes_gate_count",
+                "skipped_mpi_exchange_gate_count"):
+        required[_kk] = _mgc.get(_kk)
+
+    # ── MPI remote-cache telemetry (measured + aggregated across ranks) ──
+    _mt = result.get("mpi_telemetry") or {}
+    for _kk in ("remote_buffer_cache_hits", "remote_buffer_cache_misses",
+                "remote_buffer_cache_hit_rate", "distinct_remote_chunks_per_rank",
+                "repeated_remote_chunk_fetches",
+                "repeated_remote_chunk_fetches_adjacent_steps",
+                "mpi_steps", "mpi_gates_per_step", "remote_cache_scope",
+                "diagonal_mpi_applications", "exchange_mpi_applications",
+                "requires_remote_amplitudes_applications"):
+        required[_kk] = _mt.get(_kk)
 
     if "correct" in result:
         required["correct"] = result["correct"]
