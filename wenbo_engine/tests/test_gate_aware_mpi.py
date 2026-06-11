@@ -238,3 +238,17 @@ def test_nonlocal_kernel_backend_equivalent():
     if "numba" in out:
         assert np.allclose(out["numpy"][0], out["numba"][0], atol=1e-5)
         assert np.allclose(out["numpy"][1], out["numba"][1], atol=1e-5)
+
+
+# ── diagonal split keeps the exchange path for non-diagonal gates ────────
+
+def test_classify_mpi_gates_splits_diagonal_vs_exchange():
+    from wenbo_engine.bench.communication_workloads import build_circuit, classify_mpi_gates
+    # mpi_nonlocal_heavy mixes diagonal (CZ/CR) and permutation (CNOT) MPI gates
+    c = classify_mpi_gates(build_circuit("mpi_nonlocal_heavy", 24, 20, 20, 4, 42), 20, 4)
+    assert c["diagonal_mpi_nonlocal_gate_count"] > 0      # some are skippable
+    assert (c["permutation_mpi_nonlocal_gate_count"]
+            + c["true_mixing_mpi_nonlocal_gate_count"]) > 0  # some still exchange
+    assert c["requires_remote_amplitudes_gate_count"] == (
+        c["permutation_mpi_nonlocal_gate_count"]
+        + c["true_mixing_mpi_nonlocal_gate_count"])
