@@ -330,3 +330,16 @@ def test_metrics_in_final_summary(tmp):
               "mpi_window_fallback_reasons",
               "expected_recomputation_cost_increase", "final_norm"):
         assert k in fs, k
+
+
+# calibrated-cost-model telemetry: a window run reports its gather/scatter/
+# leader/segment timing (explains why SAFE can cut bytes yet be slower).
+@_mark
+def test_window_reports_timing_breakdown(tmp):
+    fs, _, _, _ = _run(tmp, "mpi_nonlocal_mixing_heavy", "safe")
+    assert fs["mpi_windows_executed"] >= 1
+    for k in ("mpi_collective_gather_time", "mpi_collective_scatter_time",
+              "mpi_window_leader_compute_time", "mpi_window_segment_time"):
+        assert k in fs and fs[k] > 0, k
+    # the window's own collective traffic is reported separately from pairwise
+    assert fs["mpi_window_gather_bytes"] > 0

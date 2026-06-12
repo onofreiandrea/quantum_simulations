@@ -231,3 +231,83 @@ def recovery_aware_cost(*, bytes_read: int, bytes_written: int,
         "expected_recomputation_cost": recompute,
         "estimated_total_cost": total,
     }
+
+
+# ── measured calibration (Planner v2 telemetry) ─────────────────────────
+# Derive the cost-model constants from ONE measured run's timing + byte/gate
+# counts.  Every constant is either a measured float or ``None`` with a sibling
+# ``<name>_reason`` string — never silently omitted (so Planner v2 knows what it
+# is missing).  Bandwidths are GB/s (1 GB = 1e9 bytes), rates gates/s, commit_ms
+# milliseconds.
+
+_GB_ = 1_000_000_000.0
+
+
+def _rate(num, den, *, scale=1.0, reason):
+    """num/den*scale when den>0 and num available, else (None, reason)."""
+    if num is None:
+        return None, reason
+    if not den or den <= 0:
+        return None, reason
+    return (num / den) * scale, None
+
+
+def build_calibration(measured: dict) -> dict:
+    """Build calibrated cost-model constants from a measured run.
+
+    ``measured`` keys (all optional; absence -> null+reason):
+      bytes_read, read_sec, bytes_written, write_sec,
+      mpi_bytes_sent, mpi_pairwise_sendrecv_time,
+      gather_bytes, gather_time, scatter_bytes, scatter_time,
+      local_gates_applied, local_kernel_time,
+      nonlocal_gates_applied, nonlocal_kernel_time,
+      commit_time, commit_count, state_bytes, norm_time,
+      numba_speedup_factor (or None).
+    """
+    m = measured
+    out: dict = {}
+
+    def put(name, value, reason):
+        out[name] = value
+        out[name + "_reason"] = reason
+
+    v, r = _rate(m.get("bytes_read"), m.get("read_sec"), scale=1 / _GB_,
+                 reason="no chunk-file reads measured (e.g. direct-extent or "
+                        "fully-overlayed run)")
+    put("nvme_read_gbps", v, r)
+    v, r = _rate(m.get("bytes_written"), m.get("write_sec"), scale=1 / _GB_,
+                 reason="no chunk-file writes measured this run")
+    put("nvme_write_gbps", v, r)
+    v, r = _rate(m.get("mpi_bytes_sent"), m.get("mpi_pairwise_sendrecv_time"),
+                 scale=1 / _GB_,
+                 reason="no pairwise Sendrecv this run (window executor uses "
+                        "collectives, or single-rank run)")
+    put("pairwise_mpi_gbps", v, r)
+    v, r = _rate(m.get("gather_bytes"), m.get("gather_time"), scale=1 / _GB_,
+                 reason="no window gather this run (window executor off or no "
+                        "executable window)")
+    put("collective_gather_gbps", v, r)
+    v, r = _rate(m.get("scatter_bytes"), m.get("scatter_time"), scale=1 / _GB_,
+                 reason="no window scatter this run")
+    put("collective_scatter_gbps", v, r)
+    v, r = _rate(m.get("local_gates_applied"), m.get("local_kernel_time"),
+                 reason="no local-kernel gates measured this run")
+    put("local_kernel_gates_per_sec", v, r)
+    v, r = _rate(m.get("nonlocal_gates_applied"), m.get("nonlocal_kernel_time"),
+                 reason="no nonlocal-kernel gates measured (e.g. diagonal "
+                        "fast-path or window-executor run applies no pair "
+                        "kernels)")
+    put("nonlocal_kernel_gates_per_sec", v, r)
+    nsf = m.get("numba_speedup_factor")
+    put("numba_speedup_factor", nsf,
+        None if nsf is not None else
+        "needs a numpy-vs-numba A/B; a single-backend run cannot measure it")
+    ct, cc = m.get("commit_time"), m.get("commit_count")
+    if ct is not None and cc:
+        put("commit_ms", (ct / cc) * 1000.0, None)
+    else:
+        put("commit_ms", None, "no commits measured this run")
+    v, r = _rate(m.get("state_bytes"), m.get("norm_time"), scale=1 / _GB_,
+                 reason="norm scan not timed this run")
+    put("norm_scan_gbps", v, r)
+    return out

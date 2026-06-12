@@ -27,6 +27,43 @@ def _error_pct(predicted, actual):
     return round((actual - predicted) / denom * 100.0, 2)
 
 
+# Measured timing fields surfaced in the cost report's timing block.  Planner
+# v2's predicted timing is not implemented on this branch, so each predicted
+# value is null-with-reason while the ACTUAL measured value is reported.
+_TIMING_FIELDS = (
+    "local_kernel_time", "nonlocal_kernel_time",
+    "mpi_pairwise_sendrecv_time", "mpi_collective_gather_time",
+    "mpi_collective_scatter_time", "mpi_window_leader_compute_time",
+    "mpi_window_segment_time", "direct_extent_read_time",
+    "direct_extent_write_time", "extent_materialize_time", "extent_pack_time",
+    "commit_time", "norm_time", "numba_compile_time",
+)
+
+_NO_PREDICTED_TIMING = ("Planner v2 predicted timing is not implemented on this "
+                        "branch (calibration-only); actual is measured.")
+
+
+def build_timing_report(measured: dict) -> dict:
+    """Predicted-vs-actual timing block for cost_report.json.
+
+    Actual values come from the measured run; predicted is null-with-reason
+    until Planner v2 lands.  A measured field that is absent is reported as
+    null with its own reason (never silently omitted).
+    """
+    block = {}
+    for f in _TIMING_FIELDS:
+        actual = measured.get(f)
+        block[f] = {
+            "predicted": None,
+            "predicted_reason": _NO_PREDICTED_TIMING,
+            "actual": actual,
+            "actual_reason": (None if actual is not None
+                              else f"{f} not measured this run"),
+            "prediction_error_pct": None,
+        }
+    return block
+
+
 def build_cost_report(plan: dict, actual: dict) -> dict:
     """Build cost_report.json content.
 
@@ -81,6 +118,7 @@ def build_cost_report(plan: dict, actual: dict) -> dict:
         "actual_work_time": actual.get("work_time"),
         "num_ranks": actual.get("num_ranks"),
         "metrics": metrics,
+        "timing": build_timing_report(actual),
         "predicted_cost_by_candidate":
             plan["decision"].get("predicted_cost_by_candidate", {}),
         "note": ("Predictions come from the analytical v1 cost model; MPI "
