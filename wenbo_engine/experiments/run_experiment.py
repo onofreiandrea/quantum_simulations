@@ -483,7 +483,9 @@ def _run_mpi(cfg, circuit, work_dir, chunk_size, run_dir, comm, n_ranks, rank):
                    max_overlay_chunks=getattr(cfg, "max_overlay_chunks", None),
                    max_remote_buffer_gib=getattr(cfg, "max_remote_buffer_gib", None),
                    auto_chunk_bits=bool(getattr(cfg, "auto_chunk_bits", False)),
-                   kernel_backend=getattr(cfg, "kernel_backend", "auto"))
+                   kernel_backend=getattr(cfg, "kernel_backend", "auto"),
+                   mpi_window_execution=getattr(
+                       cfg, "mpi_window_execution", "off"))
     comm.Barrier()
 
     # Durable R4: promote committed generations to durable storage AFTER the
@@ -697,6 +699,10 @@ def main(argv=None) -> int:
                     choices=["off", "report"], default="off",
                     help="analysis-only MPI window feasibility report "
                          "(off|report); never changes execution.")
+    ap.add_argument("--mpi-window-execution", dest="mpi_window_execution",
+                    choices=["off", "safe"], default="off",
+                    help="execute RAM-feasible true-mixing MPI windows "
+                         "(off|safe); off by default.")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -720,6 +726,7 @@ def main(argv=None) -> int:
     cfg.max_remote_buffer_gib = args.max_remote_buffer_gib
     cfg.kernel_backend = args.kernel_backend
     cfg.mpi_window_analysis = args.mpi_window_analysis
+    cfg.mpi_window_execution = args.mpi_window_execution
     cfg.validate()
 
     run_dir = run_experiment(cfg, run_id=args.run_id)
