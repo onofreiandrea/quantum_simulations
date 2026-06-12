@@ -28,6 +28,7 @@ from wenbo_engine.storage.block_store import DTYPE
 from wenbo_engine.storage.extent_manifest import (
     ExtentManifest, ExtentChunkRecord, extent_filename, EXTENTS_DIRNAME,
 )
+from wenbo_engine.profiling import runtime_timers as _rt
 
 _ITEMSIZE = np.dtype(DTYPE).itemsize
 # Default max bytes per extent file before rolling to a new one (128 MiB).
@@ -203,9 +204,10 @@ def read_chunk_from_extent(gen_dir, extent_id: int, offset: int,
     ``length`` come from the rank manifest's extent record for the chunk.
     """
     path = Path(gen_dir) / EXTENTS_DIRNAME / extent_filename(extent_id)
-    with open(path, "rb") as f:
-        f.seek(offset)
-        raw = f.read(length)
+    with _rt.timed("direct_extent_read_time"):
+        with open(path, "rb") as f:
+            f.seek(offset)
+            raw = f.read(length)
     if len(raw) != length:
         raise ValueError(f"extent {extent_id}: short read ({len(raw)} != {length})")
     return np.frombuffer(raw, dtype=DTYPE).copy()
@@ -252,11 +254,12 @@ class ExtentWriter:
 
     def append(self, chunk_id: int, arr: np.ndarray) -> ExtentChunkRecord:
         payload = np.ascontiguousarray(arr, dtype=DTYPE).tobytes()
-        if self._off > 0 and self._off + len(payload) > self.extent_bytes:
-            self._close()
-            self.extent_id += 1
-            self._open()
-        self._f.write(payload)
+        with _rt.timed("direct_extent_write_time"):
+            if self._off > 0 and self._off + len(payload) > self.extent_bytes:
+                self._close()
+                self.extent_id += 1
+                self._open()
+            self._f.write(payload)
         rec = ExtentChunkRecord(chunk_id=chunk_id, extent_id=self.extent_id,
                                 offset=self._off, length=len(payload),
                                 checksum=_sha256_bytes(payload))
@@ -265,7 +268,8 @@ class ExtentWriter:
         return rec
 
     def finalize(self) -> ExtentManifest:
-        self._close()
+        with _rt.timed("direct_extent_write_time"):
+            self._close()
         return ExtentManifest(
             n_chunks=len(self.records), n_extents=self.extent_id + 1,
             chunk_size=self.chunk_size, dtype=str(np.dtype(DTYPE)),

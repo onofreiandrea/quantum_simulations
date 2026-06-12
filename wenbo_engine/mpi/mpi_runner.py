@@ -44,6 +44,7 @@ from wenbo_engine.kernel.cpu_nonlocal import (
 from wenbo_engine.storage.block_store import (
     DTYPE, chunk_filename, read_chunk, write_chunk_atomic,
 )
+from wenbo_engine.profiling import runtime_timers as _rt
 
 log = logging.getLogger(__name__)
 
@@ -100,6 +101,8 @@ _WIN_EXEC = {
     "window_sendrecv_count": 0, "commits_saved": 0,
     "estimated_ram_gib": 0.0, "expected_recomputation_cost_increase": 0.0,
     "fallbacks": 0, "fallback_reasons": [],
+    "gather_time": 0.0, "scatter_time": 0.0,
+    "leader_compute_time": 0.0, "segment_time": 0.0,
 }
 
 
@@ -108,7 +111,9 @@ def _reset_window_exec(mode: str = "off") -> None:
                      window_gates_executed=0, gather_bytes=0, scatter_bytes=0,
                      window_sendrecv_count=0, commits_saved=0,
                      estimated_ram_gib=0.0,
-                     expected_recomputation_cost_increase=0.0, fallbacks=0)
+                     expected_recomputation_cost_increase=0.0, fallbacks=0,
+                     gather_time=0.0, scatter_time=0.0,
+                     leader_compute_time=0.0, segment_time=0.0)
     _WIN_EXEC["fallback_reasons"] = []
 
 
@@ -121,12 +126,17 @@ def _finalize_window_exec(work_dir, comm) -> None:
         gather_b = s(w["gather_bytes"]); scatter_b = s(w["scatter_bytes"])
         sr = s(w["window_sendrecv_count"])
         est_ram = mx(w["estimated_ram_gib"])
+        sg = lambda x: comm.allreduce(float(x), op=MPI.SUM)
+        gather_t = sg(w["gather_time"]); scatter_t = sg(w["scatter_time"])
+        leader_t = sg(w["leader_compute_time"]); seg_t = sg(w["segment_time"])
         # gather fallback reasons from all ranks (rank 0 keeps the union)
         all_reasons = comm.gather(list(w["fallback_reasons"]), root=0)
     else:
         gather_b, scatter_b, sr = (w["gather_bytes"], w["scatter_bytes"],
                                    w["window_sendrecv_count"])
         est_ram = w["estimated_ram_gib"]
+        gather_t, scatter_t = w["gather_time"], w["scatter_time"]
+        leader_t, seg_t = w["leader_compute_time"], w["segment_time"]
         all_reasons = [list(w["fallback_reasons"])]
     if comm is not None and comm.Get_rank() != 0:
         return
@@ -149,9 +159,61 @@ def _finalize_window_exec(work_dir, comm) -> None:
         "mpi_window_fallback_reasons": reasons,
         "expected_recomputation_cost_increase":
             round(w["expected_recomputation_cost_increase"], 6),
+        "mpi_collective_gather_time": round(gather_t, 6),
+        "mpi_collective_scatter_time": round(scatter_t, 6),
+        "mpi_window_leader_compute_time": round(leader_t, 6),
+        "mpi_window_segment_time": round(seg_t, 6),
     }
     try:
         (Path(work_dir) / "mpi_window_exec.json").write_text(json.dumps(out))
+    except OSError:
+        pass
+
+
+def _measure_rss_gib() -> tuple[float | None, str | None]:
+    """Peak resident set size of this process in GiB (None + reason if N/A)."""
+    try:
+        import resource
+        import sys
+        ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux reports KiB, macOS/BSD report bytes.
+        factor = 1 if sys.platform == "darwin" else 1024
+        return (ru * factor) / (1 << 30), None
+    except Exception as e:  # pragma: no cover - platform dependent
+        return None, f"resource.getrusage unavailable: {e!r}"
+
+
+def _finalize_runtime_timers(work_dir, comm) -> None:
+    """Aggregate runtime timing accumulators across ranks; write JSON (rank 0).
+
+    Times and counts are SUMMED across ranks (symmetric partitions, so the
+    cluster sum / cluster bytes gives a consistent average bandwidth); peak RSS
+    is MAX across ranks.  Missing timers are simply absent here and rendered as
+    null-with-reason by the reporter — never silently dropped.
+    """
+    snap = _rt.snapshot()
+    rss_gib, rss_reason = _measure_rss_gib()
+    keys = sorted(snap.keys())
+    if comm is not None and comm.Get_size() > 1:
+        # union of keys across ranks (a rank may not have hit a given timer)
+        gathered = comm.allgather(keys)
+        union = sorted({k for ks in gathered for k in ks})
+        agg = {}
+        for k in union:
+            agg[k] = comm.allreduce(float(snap.get(k, 0.0)), op=MPI.SUM)
+        rss_all = comm.allreduce(float(rss_gib) if rss_gib is not None else -1.0,
+                                 op=MPI.MAX)
+        rss_gib = rss_all if rss_all >= 0 else None
+    else:
+        agg = {k: float(v) for k, v in snap.items()}
+    if comm is not None and comm.Get_rank() != 0:
+        return
+    out = dict(agg)
+    out["rss_peak_gib"] = rss_gib
+    if rss_gib is None and rss_reason:
+        out["rss_peak_gib_reason"] = rss_reason
+    try:
+        (Path(work_dir) / "timing_metrics.json").write_text(json.dumps(out))
     except OSError:
         pass
 
@@ -1186,6 +1248,7 @@ def run(
         raise ValueError(f"unknown mpi_window_execution {mpi_window_execution!r} "
                          "(expected off|safe)")
     _reset_window_exec(mpi_window_execution)
+    _rt.reset()
 
     # RAM-aware execution control: resolve per-rank overlay + remote-cache
     # budgets and FAIL EARLY (before any large allocation) if a single chunk +
@@ -1211,6 +1274,7 @@ def run(
         _write_kernel_metrics(work_dir, comm)
         _finalize_mpi_telemetry(work_dir, comm)
         _finalize_window_exec(work_dir, comm)
+        _finalize_runtime_timers(work_dir, comm)
         return result
     # none / wal share the double-buffer path; WAL writes are gated below.
     use_wal = (recovery == "wal")
@@ -1353,10 +1417,19 @@ def run(
     _write_ram_metrics(work_dir, comm, ram_meta)
     _write_kernel_metrics(work_dir, comm)
     _finalize_mpi_telemetry(work_dir, comm)
+    _finalize_runtime_timers(work_dir, comm)
     return src_dir  # committed state directory
 
 
 # ── extent-layout helpers (committed gens stored as extents at rest) ────
+
+def _timed_commit(gm, *args, **kwargs):
+    """Time + count each generation commit (measurement only)."""
+    with _rt.timed("commit_time"):
+        rec = gm.commit_step(*args, **kwargs)
+    _rt.add_count("commit_count_runtime", 1)
+    return rec
+
 
 def _materialize_source_if_extent(gen_directory: Path) -> None:
     """If a committed generation is extent-backed, unpack it to chunk files.
@@ -1369,7 +1442,8 @@ def _materialize_source_if_extent(gen_directory: Path) -> None:
     if RankManifest.exists(gen_directory):
         man = RankManifest.read(gen_directory)
         if any(c.is_extent for c in man.chunks):
-            materialize_to_chunk_files(gen_directory, man.chunks)
+            with _rt.timed("extent_materialize_time"):
+                materialize_to_chunk_files(gen_directory, man.chunks)
 
 
 def _extent_pack_records(cdir: Path, n_chunks_per_rank: int, chunk_size: int):
@@ -1381,7 +1455,8 @@ def _extent_pack_records(cdir: Path, n_chunks_per_rank: int, chunk_size: int):
     """
     from wenbo_engine.storage.extent_store import pack_chunk_files
     from wenbo_engine.recovery.rank_manifest import ChunkRecord
-    man = pack_chunk_files(cdir.parent, n_chunks_per_rank, chunk_size=chunk_size)
+    with _rt.timed("extent_pack_time"):
+        man = pack_chunk_files(cdir.parent, n_chunks_per_rank, chunk_size=chunk_size)
     recs = []
     for ci in range(n_chunks_per_rank):
         er = man.records[ci]
@@ -1485,7 +1560,7 @@ def _run_compute_units(gm, comm, rank, work, steps, cur_gen,
                             FaultPoint.AFTER_PARTIAL_WRITE, rank, _ls)
                 return recs
 
-        rec = gm.commit_step(next_gen, last_step, _writer,
+        rec = _timed_commit(gm, next_gen, last_step, _writer,
                              parent_generation=cur_gen)
         if rec is None:
             raise RuntimeError(
@@ -1552,7 +1627,7 @@ def _execute_window_gen(gm, comm, rank, work, win, cur_gen, n_chunks_per_rank,
                     FaultPoint.AFTER_PARTIAL_WRITE, rank, win.end_step)
         return recs
 
-    rec = gm.commit_step(next_gen, win.end_step, _writer,
+    rec = _timed_commit(gm, next_gen, win.end_step, _writer,
                          parent_generation=cur_gen)
     if rec is None:
         raise RuntimeError(
@@ -1570,6 +1645,10 @@ def _execute_window_gen(gm, comm, rank, work, win, cur_gen, n_chunks_per_rank,
         _WIN_EXEC["estimated_ram_gib"], win.estimated_ram_gib)
     _WIN_EXEC["expected_recomputation_cost_increase"] += \
         _cm.recomputation_cost_increase(win.n_gates, win.n_steps, 1)
+    _WIN_EXEC["gather_time"] += wm.gather_time
+    _WIN_EXEC["scatter_time"] += wm.scatter_time
+    _WIN_EXEC["leader_compute_time"] += wm.leader_compute_time
+    _WIN_EXEC["segment_time"] += wm.segment_time
 
     if rank == 0:
         log.info("  window steps %d-%d (%d gates, group=%d) -> gen %d in %.1fs",
@@ -1687,7 +1766,7 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
                 return _extent_pack_records(cdir, n_chunks_per_rank, chunk_size)
             return [gm.chunk_record(cdir, ci) for ci in range(n_chunks_per_rank)]
 
-        rec = gm.commit_step(0, -1, _init_writer)
+        rec = _timed_commit(gm, 0, -1, _init_writer)
         if rec is None:
             raise RuntimeError("failed to commit initial generation 0")
         cur_gen = 0
@@ -1793,7 +1872,7 @@ def _run_generation(circuit_dict: dict, work_dir: str | Path,
                         FaultPoint.AFTER_PARTIAL_WRITE, rank, step_idx)
             return recs
 
-        rec = gm.commit_step(next_gen, step_idx, _writer,
+        rec = _timed_commit(gm, next_gen, step_idx, _writer,
                              parent_generation=cur_gen)
         if rec is None:
             raise RuntimeError(

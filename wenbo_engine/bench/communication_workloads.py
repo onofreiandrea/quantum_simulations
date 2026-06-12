@@ -683,6 +683,11 @@ class Metrics:
     read_sec: float = 0.0
     write_sec: float = 0.0
     kernel_time: float = 0.0
+    local_kernel_time: float = 0.0
+    nonlocal_kernel_time: float = 0.0
+    local_gates_applied: int = 0
+    nonlocal_gates_applied: int = 0
+    norm_time: float = 0.0
     stage_time: float = 0.0
     # measured communication partners and per-call exchange events
     observed_partner_pairs: set = field(default_factory=set)
@@ -705,6 +710,11 @@ class Metrics:
             "read_sec": self.read_sec,
             "write_sec": self.write_sec,
             "kernel_time": self.kernel_time,
+            "local_kernel_time": self.local_kernel_time,
+            "nonlocal_kernel_time": self.nonlocal_kernel_time,
+            "local_gates_applied": self.local_gates_applied,
+            "nonlocal_gates_applied": self.nonlocal_gates_applied,
+            "norm_time": self.norm_time,
             "stage_time": self.stage_time,
             "observed_partner_pairs": sorted(
                 sorted(pr) for pr in self.observed_partner_pairs),
@@ -796,12 +806,24 @@ def _instrument_runner(metrics: Metrics):
             return r
         return w
 
-    def wrap_kernel(orig):
+    # local (within-chunk) vs nonlocal (partner-chunk) kernels — split so the
+    # cost model can calibrate them separately.
+    _local_kernels = {"apply_1q", "apply_2q"}
+
+    def wrap_kernel(orig, name):
+        is_local = name in _local_kernels
         def w(*a, **k):
             t0 = time.perf_counter()
             r = orig(*a, **k)
+            dt = time.perf_counter() - t0
             with metrics.lock:
-                metrics.kernel_time += time.perf_counter() - t0
+                metrics.kernel_time += dt
+                if is_local:
+                    metrics.local_kernel_time += dt
+                    metrics.local_gates_applied += 1
+                else:
+                    metrics.nonlocal_kernel_time += dt
+                    metrics.nonlocal_gates_applied += 1
             return r
         return w
 
@@ -816,20 +838,54 @@ def _instrument_runner(metrics: Metrics):
     if _ov is not None:
         ov_saved = {n: getattr(_ov, n) for n in io_names}
 
+    # The window executor resolves read_chunk/write_chunk_atomic in its own
+    # namespace; instrument those too so window disk I/O is measured (else
+    # nvme bandwidth can't be calibrated on a window run).
+    try:
+        from wenbo_engine.mpi import window_executor as _we
+    except Exception:
+        _we = None
+    we_saved = {}
+    if _we is not None:
+        we_saved = {n: getattr(_we, n) for n in io_names if hasattr(_we, n)}
+
+    # The gate-aware MPI path runs the nonlocal *pair* kernels inside
+    # exchange_batch's namespace; instrument those so nonlocal_kernel_time is
+    # measured on gate_aware runs (the naive path uses mr's names, already wrapped).
+    try:
+        from wenbo_engine.mpi import exchange_batch as _eb
+    except Exception:
+        _eb = None
+    eb_kernel_names = ("apply_1q_pair", "apply_2q_pair_qa_local",
+                       "apply_2q_pair_qb_local")
+    eb_saved = {}
+    if _eb is not None:
+        eb_saved = {n: getattr(_eb, n) for n in eb_kernel_names
+                    if hasattr(_eb, n)}
+
     try:
         mr.read_chunk = wrap_read(saved["read_chunk"])
         mr.write_chunk_atomic = wrap_write(saved["write_chunk_atomic"])
         for name in kernel_names:
-            setattr(mr, name, wrap_kernel(saved[name]))
+            setattr(mr, name, wrap_kernel(saved[name], name))
         if _ov is not None:
             _ov.read_chunk = wrap_read(ov_saved["read_chunk"])
             _ov.write_chunk_atomic = wrap_write(ov_saved["write_chunk_atomic"])
+        if _we is not None and we_saved:
+            _we.read_chunk = wrap_read(we_saved["read_chunk"])
+            _we.write_chunk_atomic = wrap_write(we_saved["write_chunk_atomic"])
+        for name, fn in eb_saved.items():
+            setattr(_eb, name, wrap_kernel(fn, name))
         yield
     finally:
         for name, fn in saved.items():
             setattr(mr, name, fn)
         for name, fn in ov_saved.items():
             setattr(_ov, name, fn)
+        for name, fn in we_saved.items():
+            setattr(_we, name, fn)
+        for name, fn in eb_saved.items():
+            setattr(_eb, name, fn)
 
 
 # ── run + aggregate ────────────────────────────────────────────────────
@@ -1070,6 +1126,16 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         except (OSError, ValueError):
             mpi_window_exec = {}
 
+    # Runtime timing accumulators (commit/extent/materialize/pack/rss), written
+    # by run() via runtime_timers.
+    timing_metrics = {}
+    tm_path = Path(work_dir) / "timing_metrics.json"
+    if tm_path.exists():
+        try:
+            timing_metrics = json.loads(tm_path.read_text())
+        except (OSError, ValueError):
+            timing_metrics = {}
+
     ram_metrics = {}
     rm_path = Path(work_dir) / "ram_metrics.json"
     if rm_path.exists():
@@ -1085,8 +1151,11 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
     if durable and durable.get("enabled") and recovery == "generation":
         durable_promotion = _durable_promote(work_dir, comm, durable)
 
-    # Global norm (collective — all ranks participate).
+    # Global norm (collective — all ranks participate).  Timed for the cost
+    # model's norm-scan bandwidth calibration.
+    _norm_t0 = time.perf_counter()
     norm = compute_norm(work_dir, comm)
+    metrics.norm_time += time.perf_counter() - _norm_t0
 
     correct = None
     if verify:
@@ -1103,6 +1172,49 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         return None
 
     aggregate = _aggregate(all_metrics)
+    # ── assemble the measured-timing dict (single source for final_summary,
+    # cost_report timing block, and calibration) ──
+    _km0 = {}
+    _kmpath = Path(work_dir) / "kernel_metrics.json"
+    if _kmpath.exists():
+        try:
+            _km0 = json.loads(_kmpath.read_text())
+        except (OSError, ValueError):
+            _km0 = {}
+    _state_bytes = (1 << n) * int(np.dtype(np.complex64).itemsize)
+    measured_timing = {
+        "local_kernel_time": aggregate.get("local_kernel_time"),
+        "nonlocal_kernel_time": aggregate.get("nonlocal_kernel_time"),
+        "mpi_pairwise_sendrecv_time": aggregate.get("mpi_pairwise_sendrecv_time"),
+        "mpi_collective_gather_time": mpi_window_exec.get("mpi_collective_gather_time"),
+        "mpi_collective_scatter_time": mpi_window_exec.get("mpi_collective_scatter_time"),
+        "mpi_window_leader_compute_time": mpi_window_exec.get("mpi_window_leader_compute_time"),
+        "mpi_window_segment_time": mpi_window_exec.get("mpi_window_segment_time"),
+        "direct_extent_read_time": timing_metrics.get("direct_extent_read_time"),
+        "direct_extent_write_time": timing_metrics.get("direct_extent_write_time"),
+        "extent_materialize_time": timing_metrics.get("extent_materialize_time"),
+        "extent_pack_time": timing_metrics.get("extent_pack_time"),
+        "commit_time": timing_metrics.get("commit_time"),
+        "norm_time": aggregate.get("norm_time"),
+        "numba_compile_time": _km0.get("numba_compile_time"),
+        "rss_peak_gib": timing_metrics.get("rss_peak_gib"),
+        "rss_peak_gib_reason": timing_metrics.get("rss_peak_gib_reason"),
+        # raw byte/gate/count inputs for calibration
+        "bytes_read": aggregate.get("bytes_read"),
+        "read_sec": aggregate.get("read_sec"),
+        "bytes_written": aggregate.get("bytes_written"),
+        "write_sec": aggregate.get("write_sec"),
+        "mpi_bytes_sent": aggregate.get("mpi_bytes_sent"),
+        "gather_bytes": mpi_window_exec.get("mpi_window_gather_bytes"),
+        "gather_time": mpi_window_exec.get("mpi_collective_gather_time"),
+        "scatter_bytes": mpi_window_exec.get("mpi_window_scatter_bytes"),
+        "scatter_time": mpi_window_exec.get("mpi_collective_scatter_time"),
+        "local_gates_applied": aggregate.get("local_gates_applied"),
+        "nonlocal_gates_applied": aggregate.get("nonlocal_gates_applied"),
+        "commit_count": timing_metrics.get("commit_count_runtime"),
+        "state_bytes": _state_bytes,
+        "numba_speedup_factor": None,   # needs numpy-vs-numba A/B
+    }
     runner_cls = runner_classification(cd, chunk_bits, num_ranks)
     mpi_gate_classes = classify_mpi_gates(cd, chunk_bits, num_ranks)
     static = classify_circuit(cd, chunk_bits, num_ranks)
@@ -1142,6 +1254,8 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
         "kernel_metrics": kernel_metrics,
         "mpi_telemetry": mpi_telemetry,
         "mpi_window_exec": mpi_window_exec,
+        "timing_metrics": timing_metrics,
+        "measured_timing": measured_timing,
         "mpi_window_execution_mode": mpi_window_execution,
         "mpi_gate_classes": mpi_gate_classes,
         "kernel_backend_requested": kernel_backend,
@@ -1216,6 +1330,7 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
             "work_time": (aggregate["read_sec"] + aggregate["write_sec"]
                           + aggregate["kernel_time"]
                           + aggregate["mpi_sendrecv_time"]),
+            **measured_timing,   # timing fields for the cost-report timing block
         }
         cost_report = build_cost_report(recovery_aware_plan, actual)
         result["planner_mode"] = "recovery_aware_v1"
@@ -1226,6 +1341,11 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
             "actual_cost_after_run": actual,
             "cost_report": cost_report,
         }
+
+    # Calibrated cost-model constants derived from THIS run's measured timing
+    # (null-with-reason where a primitive was not exercised).
+    from wenbo_engine.planner.stage_cost_model import build_calibration
+    result["calibration"] = build_calibration(measured_timing)
 
     # MPI-window feasibility analysis (rank 0, pure, post-run).  OFF by
     # default; never touches execution / recovery / remote cache.  Reads the
@@ -1274,6 +1394,14 @@ def _aggregate(all_metrics: list[dict]) -> dict:
         "read_sec": mx("read_sec"),
         "write_sec": mx("write_sec"),
         "kernel_time": mx("kernel_time"),
+        # local/nonlocal kernel time + gate counts: SUM across ranks (so the
+        # cost model's gates/sec uses the cluster's total work and total time).
+        "local_kernel_time": s("local_kernel_time"),
+        "nonlocal_kernel_time": s("nonlocal_kernel_time"),
+        "local_gates_applied": s("local_gates_applied"),
+        "nonlocal_gates_applied": s("nonlocal_gates_applied"),
+        "mpi_pairwise_sendrecv_time": s("mpi_sendrecv_time"),
+        "norm_time": mx("norm_time"),
         "stage_time": mx("stage_time"),
         "partner_rank_pairs": len(pair_set),
         "partner_rank_pair_set": sorted(sorted(pr) for pr in pair_set),
@@ -1673,6 +1801,45 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         "mpi_window_fallback_reasons", [])
     required["expected_recomputation_cost_increase"] = _we.get(
         "expected_recomputation_cost_increase", 0.0)
+
+    # ── calibrated-cost-model timing telemetry (measured; null+reason) ──
+    _mt = result.get("measured_timing") or {}
+    _timing_fields = (
+        "local_kernel_time", "nonlocal_kernel_time",
+        "mpi_pairwise_sendrecv_time", "mpi_collective_gather_time",
+        "mpi_collective_scatter_time", "mpi_window_leader_compute_time",
+        "mpi_window_segment_time", "direct_extent_read_time",
+        "direct_extent_write_time", "extent_materialize_time",
+        "extent_pack_time", "commit_time", "norm_time", "numba_compile_time",
+        "rss_peak_gib", "overlay_peak_ram_gib", "remote_buffer_peak_gib",
+    )
+    _rm2 = result.get("ram_metrics") or {}
+    for _f in _timing_fields:
+        if _f == "overlay_peak_ram_gib":
+            required[_f] = _rm2.get("overlay_peak_ram_gib")
+        elif _f == "remote_buffer_peak_gib":
+            required[_f] = _rm2.get("remote_buffer_peak_gib")
+        else:
+            required[_f] = _mt.get(_f)
+        # explicit null-with-reason: never silently omit an unavailable metric
+        if required.get(_f) is None:
+            reason = _mt.get(_f + "_reason")
+            required[_f + "_reason"] = reason or f"{_f} not measured this run"
+    # calibrated constants (also written to cost_model.json below)
+    required["calibration"] = result.get("calibration")
+
+    # cost_model.json — the measured calibration constants for Planner v2.
+    _cal = result.get("calibration")
+    if _cal is not None:
+        (d / "cost_model.json").write_text(json.dumps({
+            "source": "measured_run",
+            "workload_kind": result["workload_kind"],
+            "n": result["n"], "num_ranks": result["num_ranks"],
+            "chunk_bits": result["chunk_bits"],
+            "kernel_backend_used": (result.get("kernel_metrics") or {}).get(
+                "kernel_backend_used"),
+            "constants": _cal,
+        }, indent=2))
 
     if "correct" in result:
         required["correct"] = result["correct"]

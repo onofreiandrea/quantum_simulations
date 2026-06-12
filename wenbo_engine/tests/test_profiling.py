@@ -112,3 +112,34 @@ def test_stage_handle_thread_safe():
         for t in threads:
             t.join()
     assert sp.rows[0]["bytes_read"] == 4 * 200 * 8
+
+
+# ── runtime_timers (calibrated-cost-model telemetry) ────────────────────
+
+from wenbo_engine.profiling import runtime_timers as rt
+
+
+def test_runtime_timers_add_and_snapshot():
+    rt.reset()
+    rt.add("commit_time", 0.5)
+    rt.add("commit_time", 0.25)
+    rt.add_count("commit_count_runtime", 3)
+    snap = rt.snapshot()
+    assert snap["commit_time"] == 0.75
+    assert snap["commit_count_runtime"] == 3
+
+
+def test_runtime_timers_timed_context():
+    rt.reset()
+    with rt.timed("norm_time"):
+        sum(range(10000))
+    assert rt.get("norm_time") > 0
+    # snapshot is a copy — mutating it does not affect the live timers
+    s = rt.snapshot(); s["norm_time"] = -1
+    assert rt.get("norm_time") > 0
+
+
+def test_runtime_timers_reset_clears():
+    rt.add("extent_pack_time", 1.0)
+    rt.reset()
+    assert rt.snapshot() == {}

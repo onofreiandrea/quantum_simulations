@@ -32,11 +32,17 @@ applying the same gates step-by-step with per-step exchange.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from time import perf_counter as _perf
 
 import numpy as np
 
 from wenbo_engine.kernel import gates as _gates
 from wenbo_engine.mpi.diagonal_nonlocal import classify_nonlocal_gate
+# Module-level so the benchmark can instrument window disk I/O (mirrors how the
+# runner/overlay expose these names); the executor logic is unchanged.
+from wenbo_engine.storage.block_store import (
+    read_chunk, write_chunk_atomic, chunk_filename, DTYPE,
+)
 
 _GIB = 1 << 30
 _ITEMSIZE = 8  # complex64
@@ -110,6 +116,11 @@ class WindowExecMetrics:
     estimated_ram_gib: float = 0.0
     fallbacks: int = 0
     fallback_reasons: list = field(default_factory=list)
+    # measured timing (calibrated-cost-model telemetry)
+    gather_time: float = 0.0
+    scatter_time: float = 0.0
+    leader_compute_time: float = 0.0
+    segment_time: float = 0.0
 
 
 def _is_single_qubit_true_mixing(qs, U) -> bool:
@@ -256,9 +267,6 @@ def execute_window(comm, rank: int, win: ExecutableWindow, src_chunks_dir,
     own updated chunk into ``dst_chunks_dir``.  No cross-step cache; the gather
     is fresh for this window only.
     """
-    from wenbo_engine.storage.block_store import (
-        read_chunk, write_chunk_atomic, chunk_filename, DTYPE,
-    )
     sorted_bits = win.rank_bits
     m = len(sorted_bits)
     # color = rank with R-bits cleared → members share all non-R bits.
@@ -285,13 +293,18 @@ def execute_window(comm, rank: int, win: ExecutableWindow, src_chunks_dir,
             # stays within budget regardless of chunk size (gates act per
             # offset, so segmenting is exact).
             for a in range(0, chunk_size, seg_len):
+                _seg_t0 = _perf()
                 b = min(a + seg_len, chunk_size)
                 slen = b - a
                 seg = np.ascontiguousarray(my_chunk[a:b])
                 recvbuf = (np.empty(G * slen, dtype=DTYPE)
                            if sub_rank == 0 else None)
+                _g0 = _perf()
                 sub.Gather(seg, recvbuf, root=0)
+                _g1 = _perf()
+                metrics.gather_time += _g1 - _g0
                 if sub_rank == 0:
+                    _c0 = _perf()
                     rows = recvbuf.reshape(G, slen)
                     by_pattern = np.empty((G, slen), dtype=DTYPE)
                     for sr in range(G):
@@ -302,14 +315,18 @@ def execute_window(comm, rank: int, win: ExecutableWindow, src_chunks_dir,
                     send_rows = sendbuf.reshape(G, slen)
                     for sr in range(G):
                         send_rows[sr] = out_by_pattern[patterns[sr]]
+                    metrics.leader_compute_time += _perf() - _c0
                     metrics.gather_bytes += (G - 1) * slen * np.dtype(DTYPE).itemsize
                     metrics.scatter_bytes += (G - 1) * slen * np.dtype(DTYPE).itemsize
                     metrics.window_sendrecv_count += 2   # one Gather + one Scatter
                 else:
                     sendbuf = None
                 seg_new = np.empty(slen, dtype=DTYPE)
+                _s0 = _perf()
                 sub.Scatter(sendbuf, seg_new, root=0)
+                metrics.scatter_time += _perf() - _s0
                 my_new[a:b] = seg_new
+                metrics.segment_time += _perf() - _seg_t0
             write_chunk_atomic(dst_chunks_dir / chunk_filename(ci), my_new)
     finally:
         sub.Free()
