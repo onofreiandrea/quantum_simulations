@@ -987,13 +987,58 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
     # artifact bundle regardless.  ``current`` / None are behavior-preserving.
     planner_perm = None
     recovery_aware_plan = None
+    recovery_aware_v2_plan = None
     # Resolve the RAM working-set budget (70% of node RAM if not given) when any
     # RAM-aware control is active.
     ram_budget_resolved = None
     if auto_chunk_bits or ram_budget_gib is not None:
         ram_budget_resolved = (ram_budget_gib if ram_budget_gib is not None
                                else round(_available_ram_gib() * 0.70, 3))
-    if planner == "recovery_aware_v1":
+    if planner == "recovery_aware_v2":
+        # Recovery-aware planner v2: choose layout/execution/extent-io/MPI-
+        # exchange/MPI-window/backend by predicted WALL TIME + recovery risk
+        # (calibrated cost model).  Deterministic ⇒ every rank selects identically.
+        from wenbo_engine.planner.recovery_aware_planner_v2 import (
+            plan_recovery_aware_v2, selected_run_params_v2,
+        )
+
+        def _plan_v2(_cb):
+            return plan_recovery_aware_v2(
+                cd, n=n, chunk_bits=_cb, num_ranks=num_ranks, recovery=recovery,
+                compute_unit_min_gates=compute_unit_min_gates,
+                ram_budget_gib=ram_budget_resolved,
+                max_overlay_chunks=max_overlay_chunks,
+                max_remote_buffer_gib=max_remote_buffer_gib,
+                auto_chunk_bits=auto_chunk_bits, kernel_backend=kernel_backend)
+
+        recovery_aware_v2_plan = _plan_v2(chunk_bits)
+        if auto_chunk_bits:
+            rec_cb = recovery_aware_v2_plan["decision"].get("recommended_chunk_bits")
+            if rec_cb is None:
+                raise RuntimeError(
+                    f"RAM-infeasible: no chunk_bits fits the {ram_budget_resolved} "
+                    f"GiB/rank budget for {kind} n={n} on {num_ranks} ranks "
+                    f"(v2 selected "
+                    f"{recovery_aware_v2_plan['decision']['selected_strategy']['name']}).")
+            if rec_cb != chunk_bits:
+                chunk_bits = rec_cb
+                chunk_size = 1 << chunk_bits
+                cd = build_circuit(kind, n, depth, chunk_bits, num_ranks, seed)
+                recovery_aware_v2_plan = _plan_v2(chunk_bits)
+        _rp2 = selected_run_params_v2(recovery_aware_v2_plan)
+        storage_layout = _rp2["storage_layout"]
+        execution_mode = _rp2["execution_mode"]
+        extent_io_mode = _rp2["extent_io_mode"]
+        mpi_exchange_mode = _rp2["mpi_exchange_mode"]
+        mpi_window_execution = _rp2["mpi_window_execution"]
+        compute_unit_min_gates = _rp2["compute_unit_min_gates"]
+        kernel_backend = _rp2["kernel_backend"]
+        if rank == 0:
+            log.info("  recovery_aware_v2 selected: %s (window=%s, backend=%s, "
+                     "chunk_bits=%d)",
+                     recovery_aware_v2_plan["decision"]["selected_strategy"]["name"],
+                     mpi_window_execution, kernel_backend, chunk_bits)
+    elif planner == "recovery_aware_v1":
         # Recovery-aware planner v1: evaluate candidate strategies and SELECT
         # the run's (storage_layout, execution_mode, extent_io_mode,
         # mpi_exchange_mode, compute_unit_min_gates).  Deterministic, so every
@@ -1342,6 +1387,38 @@ def run_workload(kind: str, n: int, depth: int, chunk_bits: int,
             "cost_report": cost_report,
         }
 
+    # Recovery-aware planner v2: attach the plan + honest predicted-vs-actual
+    # wall-time cost report (actual from this run's measured timing).
+    if recovery_aware_v2_plan is not None:
+        from wenbo_engine.planner.cost_report_v2 import build_cost_report_v2
+        dec = recovery_aware_v2_plan["decision"]
+        actual_v2 = {
+            "wall_time": aggregate["stage_time"],
+            "io_time": (aggregate["read_sec"] + aggregate["write_sec"]
+                        + (measured_timing.get("direct_extent_read_time") or 0.0)
+                        + (measured_timing.get("direct_extent_write_time") or 0.0)
+                        + (measured_timing.get("extent_materialize_time") or 0.0)
+                        + (measured_timing.get("extent_pack_time") or 0.0)),
+            "kernel_time": ((measured_timing.get("local_kernel_time") or 0.0)
+                            + (measured_timing.get("nonlocal_kernel_time") or 0.0)),
+            "pairwise_mpi_time": measured_timing.get("mpi_pairwise_sendrecv_time"),
+            "collective_mpi_time": ((measured_timing.get("mpi_collective_gather_time") or 0.0)
+                                    + (measured_timing.get("mpi_collective_scatter_time") or 0.0)),
+            "window_leader_time": measured_timing.get("mpi_window_leader_compute_time"),
+            "commit_time": measured_timing.get("commit_time"),
+            "norm_time": measured_timing.get("norm_time"),
+            "peak_ram_gib": measured_timing.get("rss_peak_gib"),
+            "num_ranks": num_ranks,
+        }
+        cost_report_v2 = build_cost_report_v2(recovery_aware_v2_plan, actual_v2)
+        result["planner_mode"] = "recovery_aware_v2"
+        result["selected_strategy"] = dec["selected_strategy"]["name"]
+        result["recovery_aware_v2"] = {
+            "plan": recovery_aware_v2_plan,
+            "actual_cost_after_run": actual_v2,
+            "cost_report": cost_report_v2,
+        }
+
     # Calibrated cost-model constants derived from THIS run's measured timing
     # (null-with-reason where a primitive was not exercised).
     from wenbo_engine.planner.stage_cost_model import build_calibration
@@ -1578,6 +1655,19 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         (d / "cost_report.json").write_text(json.dumps(
             ra["cost_report"], indent=2, default=str))
 
+    # Recovery-aware planner v2 artifacts: plan_v2 + candidate table +
+    # decision report + predicted-vs-actual wall-time cost report.
+    ra2 = result.get("recovery_aware_v2")
+    if ra2 is not None:
+        plan2 = ra2["plan"]
+        (d / "plan_v2.json").write_text(json.dumps(plan2, indent=2, default=str))
+        (d / "candidate_strategies_v2.json").write_text(json.dumps(
+            plan2["candidates"], indent=2, default=str))
+        (d / "decision_report_v2.json").write_text(json.dumps(
+            plan2["decision"], indent=2, default=str))
+        (d / "cost_report_v2.json").write_text(json.dumps(
+            ra2["cost_report"], indent=2, default=str))
+
     # cost_model.json — calibration is the observability harness's job; we
     # only guarantee the artifact exists (honest "not calibrated here").
     (d / "cost_model.json").write_text(json.dumps({"calibrated": False}, indent=2))
@@ -1700,6 +1790,31 @@ def write_artifacts(output_dir: str | Path, result: dict, circuit: dict,
         required["actual_cost_after_run"] = _ra["actual_cost_after_run"]
         required["prediction_error_pct"] = {
             k: v["prediction_error_pct"] for k, v in _cr["metrics"].items()
+        }
+
+    # Recovery-aware planner v2 decision fields in final_summary.
+    _ra2 = result.get("recovery_aware_v2")
+    if _ra2 is not None:
+        _d2 = _ra2["plan"]["decision"]
+        required["planner"] = "recovery_aware_v2"
+        required["planner_mode"] = "recovery_aware_v2"
+        required["selected_strategy"] = _d2["selected_strategy"]["name"]
+        required["selected_kernel_backend"] = _d2["selected_kernel_backend"]
+        required["selected_chunk_bits"] = _d2["selected_chunk_bits"]
+        required["selected_execution_mode"] = _d2["selected_execution_mode"]
+        required["selected_storage_layout"] = _d2["selected_storage_layout"]
+        required["selected_extent_io_mode"] = _d2["selected_extent_io_mode"]
+        required["selected_mpi_exchange_mode"] = _d2["selected_mpi_exchange_mode"]
+        required["selected_mpi_window_execution"] = \
+            _d2["selected_mpi_window_execution"]
+        required["selected_ram_budget_gib"] = _d2["selected_ram_budget_gib"]
+        required["selected_commit_policy"] = _d2["selected_commit_policy"]
+        required["planner_decision_reason"] = _d2["reason_for_selection"]
+        required["predicted_wall_time_by_candidate"] = \
+            _d2["predicted_wall_time_by_candidate"]
+        required["v2_prediction_error_pct"] = {
+            k: v["prediction_error_pct"]
+            for k, v in _ra2["cost_report"]["metrics"].items()
         }
 
     _om = result.get("overlay_metrics") or {}
@@ -1911,7 +2026,11 @@ def main(argv: list[str] | None = None) -> None:
                          "apply a static transform).  Or recovery_aware_v1: "
                          "evaluate candidate strategies, select a safe one, and "
                          "write plan.json / candidate_strategies.json / "
-                         "cost_report.json (predicted vs actual).")
+                         "cost_report.json (predicted vs actual).  Or "
+                         "recovery_aware_v2: choose strategy (incl. MPI window + "
+                         "backend) by predicted WALL TIME; writes plan_v2.json / "
+                         "candidate_strategies_v2.json / decision_report_v2.json / "
+                         "cost_report_v2.json.")
     ap.add_argument("--mpi-exchange-mode", dest="mpi_exchange_mode",
                     choices=["naive", "gate_aware"], default="naive",
                     help="MPI-nonlocal exchange path: naive (one Sendrecv per "
